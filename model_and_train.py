@@ -20,14 +20,45 @@ logger.info(f"Using device: {device}")
 
 
 # ==========================================
-# 1. Multimodal Dynamic Gated Attention Adapter
+# 1. Early Stopping Utility
+# ==========================================
+class EarlyStopping:
+    """
+    Early Stopping mechanism to monitor validation loss during training.
+    Stops training early if validation loss does not improve after `patience` consecutive epochs,
+    preventing over-fitting and saving model generalization performance.
+    """
+    def __init__(self, patience: int = 7, min_delta: float = 1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float("inf")
+        self.early_stop = False
+        self.best_epoch = 0
+
+    def __call__(self, val_loss: float, epoch: int) -> bool:
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.best_epoch = epoch
+            self.counter = 0
+            return True # Improved
+        else:
+            self.counter += 1
+            logger.info(f"EarlyStopping counter: {self.counter} out of {self.patience} (Best Val Loss: {self.best_loss:.4f} at Epoch {self.best_epoch})")
+            if self.counter >= self.patience:
+                self.early_stop = True
+            return False # No improvement
+
+
+# ==========================================
+# 2. Multimodal Dynamic Gated Attention Adapter
 # ==========================================
 class MultimodalGatedAttentionAdapter(nn.Module):
     """
     Dynamic Modality Neglect Architecture for Multimodal Deepfake Detection.
     Evaluates incoming modality feature vectors (Spatial, Temporal, Biological),
     projects them into a shared latent space, and applies Softmax gating to assign
-    dynamic attention weights. Corrupted/noisy modalities receive weight ~ 0.0.
+    dynamic attention weights. Dropout regularization (p=0.4) prevents co-adaptation.
     """
     def __init__(
         self,
@@ -35,7 +66,7 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         temporal_dim: int = 512,
         biological_dim: int = 32,
         latent_dim: int = 256,
-        dropout: float = 0.3
+        dropout: float = 0.4
     ):
         super().__init__()
         self.spatial_dim = spatial_dim
@@ -43,42 +74,42 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         self.biological_dim = biological_dim
         self.latent_dim = latent_dim
 
-        # Projection Heads to Shared Latent Space (256D)
+        # Projection Heads with Dropout Regularization
         self.proj_spatial = nn.Sequential(
             nn.Linear(spatial_dim, latent_dim),
             nn.BatchNorm1d(latent_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(p=dropout)
         )
 
         self.proj_temporal = nn.Sequential(
             nn.Linear(temporal_dim, latent_dim),
             nn.BatchNorm1d(latent_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(p=dropout)
         )
 
         self.proj_biological = nn.Sequential(
             nn.Linear(biological_dim, latent_dim),
             nn.BatchNorm1d(latent_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(p=dropout)
         )
 
-        # Dynamic Gating Network
+        # Dynamic Gating Network with Dropout
         self.gating_network = nn.Sequential(
             nn.Linear(latent_dim * 3, 128),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(p=dropout),
             nn.Linear(128, 3)
         )
 
-        # Classification Head
+        # Final Classification Head with Dropout
         self.cls_head = nn.Sequential(
             nn.Linear(latent_dim * 3, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(p=dropout),
             nn.Linear(128, 1)
         )
 
@@ -114,7 +145,7 @@ class MultimodalGatedAttentionAdapter(nn.Module):
 
 
 # ==========================================
-# 2. PyTorch Dataset & Training Loop
+# 3. PyTorch Dataset & Training Loop
 # ==========================================
 class MultimodalDataset(Dataset):
     """
@@ -164,14 +195,17 @@ class MultimodalDataset(Dataset):
 def train_adapter(
     npz_path: Optional[str] = None,
     save_path: Optional[str] = None,
-    epochs: int = 30,
+    epochs: int = 50,
     batch_size: int = 16,
     lr: float = 1e-3,
-    val_split: float = 0.2
+    val_split: float = 0.2,
+    patience: int = 7,
+    dropout: float = 0.4,
+    weight_decay: float = 1e-4
 ):
     """
-    Trains MultimodalGatedAttentionAdapter on extracted .npz features with train/val split.
-    Strictly requires the real dataset; saves model weights directly to Google Drive (Colab) or Local outputs.
+    Trains MultimodalGatedAttentionAdapter with Dropout, Weight Decay (L2), and Early Stopping.
+    Prevents overfitting when fine-tuning on feature vectors.
     """
     target_npz = get_features_output_path("extracted_features.npz") if npz_path is None else resolve_path(npz_path)
     target_ckpt = get_checkpoint_path("attention_adapter.pth") if save_path is None else resolve_path(save_path)
@@ -179,7 +213,6 @@ def train_adapter(
     str_npz_path = str(target_npz)
     str_ckpt_path = str(target_ckpt)
 
-    # Strictly require real .npz dataset file; NO fallback creation during production training!
     if not os.path.exists(str_npz_path):
         raise FileNotFoundError(
             f"ERROR: Extracted features file not found at: '{str_npz_path}'\n"
@@ -204,18 +237,23 @@ def train_adapter(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
+    # Model with Dropout Regularization
     model = MultimodalGatedAttentionAdapter(
         spatial_dim=dataset.spatial_dim,
         temporal_dim=dataset.temporal_dim,
-        biological_dim=dataset.biological_dim
+        biological_dim=dataset.biological_dim,
+        dropout=dropout
     ).to(device)
 
+    # Loss & Optimizer with L2 Regularization (Weight Decay = 1e-4)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_val_loss = float("inf")
-    logger.info(f"Starting training for {epochs} epochs on {train_size} train, {val_size} val samples...")
+    # Initialize Early Stopping
+    early_stopping = EarlyStopping(patience=patience)
+
+    logger.info(f"Starting training (Max Epochs: {epochs}, Patience: {patience}, Dropout: {dropout}, WeightDecay: {weight_decay})...")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -239,6 +277,7 @@ def train_adapter(
         train_loss /= train_total
         train_acc = train_correct / train_total
 
+        # Validation Phase
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         avg_weights = np.zeros(3)
@@ -259,18 +298,27 @@ def train_adapter(
         val_acc = val_correct / max(val_total, 1)
         avg_weights /= max(val_total, 1)
 
-        if epoch % 5 == 0 or epoch == epochs or val_loss < best_val_loss:
-            logger.info(
-                f"Epoch [{epoch:02d}/{epochs:02d}] "
-                f"Train Loss: {train_loss:.4f} Acc: {train_acc*100:.1f}% | "
-                f"Val Loss: {val_loss:.4f} Acc: {val_acc*100:.1f}% | "
-                f"Weights -> S: {avg_weights[0]:.2f}, T: {avg_weights[1]:.2f}, B: {avg_weights[2]:.2f}"
-            )
+        logger.info(
+            f"Epoch [{epoch:02d}/{epochs:02d}] "
+            f"Train Loss: {train_loss:.4f} Acc: {train_acc*100:.1f}% | "
+            f"Val Loss: {val_loss:.4f} Acc: {val_acc*100:.1f}% | "
+            f"Weights -> S: {avg_weights[0]:.2f}, T: {avg_weights[1]:.2f}, B: {avg_weights[2]:.2f}"
+        )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Check Early Stopping & Save Best Checkpoint
+        is_best = early_stopping(val_loss, epoch)
+        if is_best:
             torch.save(model.state_dict(), str_ckpt_path)
-            logger.info(f"Saved best model checkpoint to '{str_ckpt_path}' (Val Loss: {val_loss:.4f})")
+            logger.info(f"--> Saved best model checkpoint to '{str_ckpt_path}' (Val Loss: {val_loss:.4f})")
+
+        if early_stopping.early_stop:
+            logger.info(f"Early stopping triggered at Epoch {epoch}! Best Val Loss: {early_stopping.best_loss:.4f} at Epoch {early_stopping.best_epoch}.")
+            break
+
+    # Restore best checkpoint weights at end of training
+    if os.path.exists(str_ckpt_path):
+        model.load_state_dict(torch.load(str_ckpt_path, map_location=device))
+        logger.info(f"Loaded optimal checkpoint weights from epoch {early_stopping.best_epoch}.")
 
     logger.info("Training pipeline completed successfully.")
 
@@ -280,9 +328,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Task 2: Attention Adapter Training Pipeline")
     parser.add_argument("--features", type=str, default=None, help="Path to .npz dataset")
     parser.add_argument("--save_path", type=str, default=None, help="Checkpoint output path")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--patience", type=int, default=7, help="Early stopping patience")
+    parser.add_argument("--dropout", type=float, default=0.4, help="Dropout probability")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="L2 weight decay")
     args = parser.parse_args()
 
     train_adapter(
@@ -290,5 +341,8 @@ if __name__ == "__main__":
         save_path=args.save_path,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        lr=args.lr
+        lr=args.lr,
+        patience=args.patience,
+        dropout=args.dropout,
+        weight_decay=args.weight_decay
     )
