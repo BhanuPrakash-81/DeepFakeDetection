@@ -1,9 +1,18 @@
-# DeepFake Detection System Configuration (CPU Optimized)
+# DeepFake Detection System Configuration (Cross-Platform MLOps Config)
+
+# Cross-Platform Storage & Path Resolution
+paths:
+  data_dir: "data"                           # Relative to project root
+  local_output_dir: "outputs"                 # Relative to project root on Local CPU
+  colab_output_dir: "/content/drive/MyDrive/DeepFake_Outputs" # Google Drive on Colab
+  features_filename: "extracted_features.npz"
+  model_filename: "attention_adapter.pth"
+  roc_plot_filename: "roc_curve.png"
 
 # Video Sampling & Preprocessing
 video:
-  target_fps: 3.0              # Strictly set to 3.0 FPS (range 2 to 5 FPS) for memory safety on CPU
-  max_frames: 60               # Cap max frames to prevent RAM overflow on 16GB CPU
+  target_fps: 3.0              # Set to 3.0 FPS for memory safety on CPU
+  max_frames: 60               # Cap max frames to prevent RAM overflow
   spatial_size: [224, 224]     # Standard image input size for visual encoder
   face_crop_margin: 0.2        # Bounding box expansion margin around detected face
   roi_margin: 0.15             # Margin around facial feature ROIs
@@ -19,18 +28,18 @@ landmarks:
 
 # Visual Feature Extraction
 visual_encoder:
-  backbone: "mobilenet_v3_small" # CPU-optimized lightweight frozen backbone
+  backbone: "efficientnet_b0"  # EfficientNet-B0 frozen visual backbone
   pretrained: true
   freeze_weights: true
-  roi_image_size: [112, 112]   # Size to crop and resize each facial ROI (eyes, nose, mouth)
-  batch_size: 16               # Batch size for batched ROI inference across frames
+  roi_image_size: [112, 112]
+  batch_size: 16
 
 # Biomechanics Feature Parameters
 biomechanics:
-  smoothing_window: 7          # Savitzky-Golay filter window size (odd integer)
-  poly_order: 2                # Savitzky-Golay polynomial order
-  normalize_scale: true        # Scale displacement relative to face size (inter-pupillary distance)
-  compute_derivatives:         # Derivatives to compute
+  smoothing_window: 7
+  poly_order: 2
+  normalize_scale: true
+  compute_derivatives:
     - displacement
     - velocity
     - acceleration
@@ -38,30 +47,19 @@ biomechanics:
 
 # Physiological rPPG Parameters
 rppg:
-  algorithm: "POS"             # Default algorithm: POS or CHROM
-  fps: 3.0                     # Sampling rate matching video sample FPS (3.0 FPS)
+  algorithm: "POS"             # Default algorithm: POS
+  fps: 3.0
   low_cutoff_hz: 0.7           # ~42 BPM
   high_cutoff_hz: 3.5          # ~210 BPM
-  filter_order: 4              # Butterworth bandpass filter order
-  skin_rois:                   # Skin regions for rPPG signal extraction
+  filter_order: 4
+  skin_rois:
     - forehead
     - left_cheek
     - right_cheek
 
-# Feature Fusion & Ablation Experiments
-fusion:
-  imputation_strategy: "median"
-  scaling: "standard"
-  experiments:
-    exp_A: "visual_face_only"
-    exp_B: "visual_parts_only"
-    exp_C: "visual_parts_biomechanics"
-    exp_D: "visual_parts_rppg"
-    exp_E: "full_model"        # Visual parts + Biomechanics + rPPG
-
 # Classifier Settings: PEFT PyTorch Anatomical Adapter
 classifier:
-  type: "pytorch_adapter"      # PEFT Lightweight Anatomical Adapter trained with SupCon + BCE Loss
+  type: "pytorch_adapter"
   pytorch_adapter_params:
     hidden_dim: 256
     proj_dim: 128
@@ -69,20 +67,9 @@ classifier:
     epochs: 30
     batch_size: 16
     learning_rate: 0.001
-    alpha_supcon: 0.5          # Weight coefficient for Supervised Contrastive Loss
-    temperature: 0.07          # Temperature scaling parameter for SupCon Loss
     weight_decay: 0.0001
-  xgboost_params:
-    n_estimators: 150
-    max_depth: 4
-    learning_rate: 0.05
-    subsample: 0.8
-    colsample_bytree: 0.8
-    objective: "binary:logistic"
-    eval_metric: "logloss"
-    random_state: 42
 
 # Hardware & System Config
 hardware:
-  device: "cpu"                # Force CPU mode for local Intel i5 / 16GB RAM environment
-  num_workers: 0               # 0 num_workers for thread safety on Windows CPU
+  device: "auto"               # Auto-detect CUDA vs CPU dynamically
+  num_workers: 0               # Thread safety across OS environments

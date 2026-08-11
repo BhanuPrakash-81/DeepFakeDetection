@@ -13,6 +13,7 @@ import torchvision.models as models
 from typing import List, Tuple, Dict, Any, Optional
 
 from models.landmark_detector import LandmarkDetector
+from utils.paths import get_features_output_path, resolve_path, load_config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -26,21 +27,15 @@ logger.info(f"Using device: {device}")
 def determine_label_from_path(video_path: str) -> float:
     """
     Smart Path-Parsing Logic for Complex Deepfake Datasets (e.g. DFD / FaceForensics++).
-    
     1. Normalizes absolute path and splits into directory components.
-    2. Scans path parts for explicit manipulation markers:
-       - FAKE keywords: 'manipulated', 'fake', 'altered', 'deepfakes', 'deepfake', 'manipulated_sequences', 'df'
-       - REAL keywords: 'original', 'real', 'youtube', 'actors', 'original_sequences'
-    3. Handles deeply nested hierarchies:
-       - Prioritizes innermost matching subfolder if path contains both keywords.
-       - Returns 1.0 for FAKE, 0.0 for REAL.
+    2. Scans path parts for explicit manipulation markers (reversed order).
     """
-    path_parts = [p.lower() for p in os.path.normpath(video_path).split(os.sep)]
+    norm_path = os.path.normpath(video_path)
+    path_parts = [p.lower() for p in norm_path.split(os.sep)]
     
     fake_keywords = {'manipulated', 'fake', 'altered', 'deepfakes', 'deepfake', 'manipulated_sequences', 'df', 'synth'}
     real_keywords = {'original', 'real', 'youtube', 'actors', 'original_sequences', 'pristine'}
     
-    # Check from deepest folder upwards (reverse order)
     for part in reversed(path_parts):
         is_fake = any(k in part for k in fake_keywords)
         is_real = any(k in part for k in real_keywords)
@@ -50,7 +45,6 @@ def determine_label_from_path(video_path: str) -> float:
         if is_real and not is_fake:
             return 0.0
             
-    # Fallback scan across all parts
     has_fake = any(any(k in part for k in fake_keywords) for part in path_parts)
     has_real = any(any(k in part for k in real_keywords) for part in path_parts)
     
@@ -59,7 +53,6 @@ def determine_label_from_path(video_path: str) -> float:
     elif has_real:
         return 0.0
     else:
-        # Fallback default alternating
         return 1.0 if "fake" in os.path.basename(video_path).lower() else 0.0
 
 
@@ -68,21 +61,18 @@ def determine_label_from_path(video_path: str) -> float:
 # ==========================================
 class FaceProcessor:
     """
-    Isolates facial crops using MediaPipe Face Landmarker and applies real-world noise augmentations
-    (JPEG compression & Gaussian blur) to force dynamic gating models to learn modality neglect.
+    Isolates facial crops using MediaPipe Face Landmarker and applies real-world noise augmentations.
     """
     def __init__(self, model_path: str = "face_landmarker.task"):
+        resolved_task_path = str(resolve_path(model_path))
         try:
-            self.detector = LandmarkDetector(model_path=model_path)
+            self.detector = LandmarkDetector(model_path=resolved_task_path)
             self.has_detector = True
         except Exception as e:
-            logger.warning(f"Could not load LandmarkDetector from '{model_path}': {e}. Using fallback bounding box.")
+            logger.warning(f"Could not load LandmarkDetector from '{resolved_task_path}': {e}. Using fallback bounding box.")
             self.has_detector = False
 
     def extract_face_and_forehead(self, frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
-        """
-        Extracts face crop and forehead ROI for rPPG.
-        """
         h, w, _ = frame_bgr.shape
         xmin, ymin, xmax, ymax = 0, 0, w, h
 
@@ -101,7 +91,6 @@ class FaceProcessor:
 
         face_crop = frame_bgr[ymin:ymax, xmin:xmax]
 
-        # Forehead ROI: top 25% of face bounding box, center 60% width
         fh_ymin = ymin
         fh_ymax = ymin + int(box_h * 0.25)
         fh_xmin = xmin + int(box_w * 0.2)
@@ -116,14 +105,9 @@ class FaceProcessor:
 
     @staticmethod
     def apply_noise_augmentations(face_crop: np.ndarray, prob: float = 0.5) -> np.ndarray:
-        """
-        Randomly applies JPEG compression and Gaussian blur to corrupt Spatial/Biological signals.
-        """
         augmented = face_crop.copy()
-        
-        # Random JPEG Compression
         if random.random() < prob:
-            quality = random.randint(10, 50) # Low quality JPEG artifact
+            quality = random.randint(10, 50)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
             _, enc_img = cv2.imencode('.jpg', augmented, encode_param)
             if enc_img is not None:
@@ -131,7 +115,6 @@ class FaceProcessor:
                 if decoded is not None:
                     augmented = decoded
 
-        # Random Gaussian Blur
         if random.random() < prob:
             ksize = random.choice([5, 7, 9, 11])
             augmented = cv2.GaussianBlur(augmented, (ksize, ksize), 0)
@@ -143,9 +126,6 @@ class FaceProcessor:
 # 2. Extractors: Spatial, Temporal, Biological
 # ==========================================
 class SpatialExtractor(nn.Module):
-    """
-    Spatial Branch: Frozen EfficientNet-B0 extracting 1280-dim spatial artifact features.
-    """
     def __init__(self):
         super().__init__()
         weights = models.EfficientNet_B0_Weights.DEFAULT
@@ -153,15 +133,11 @@ class SpatialExtractor(nn.Module):
         self.feature_extractor = backbone.features
         self.pool = backbone.avgpool
         self.feature_dim = 1280
-
         for p in self.parameters():
             p.requires_grad = False
         self.eval()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, 3, H, W) normalized image tensors
-        """
         with torch.no_grad():
             feat = self.feature_extractor(x)
             feat = self.pool(feat)
@@ -170,10 +146,6 @@ class SpatialExtractor(nn.Module):
 
 
 class TemporalShiftModule(nn.Module):
-    """
-    Temporal Branch: Temporal Shift Module (TSM) zero-FLOP temporal feature extractor.
-    Shifts channels across consecutive temporal frames before pooling.
-    """
     def __init__(self, in_channels: int = 1280, out_channels: int = 512, n_div: int = 8):
         super().__init__()
         self.in_channels = in_channels
@@ -189,40 +161,28 @@ class TemporalShiftModule(nn.Module):
         self.eval()
 
     def forward(self, seq_features: torch.Tensor) -> torch.Tensor:
-        """
-        seq_features: (B, T, C) tensor of spatial features across frames
-        """
         with torch.no_grad():
             B, T, C = seq_features.shape
             if T <= 1:
                 return seq_features.mean(dim=1)[:, :512]
             
-            # Temporal Shift Logic
             fold = C // self.n_div
             shifted = torch.zeros_like(seq_features)
-            shifted[:, :-1, :fold] = seq_features[:, 1:, :fold]  # shift left
-            shifted[:, 1:, fold:2*fold] = seq_features[:, :-1, fold:2*fold]  # shift right
-            shifted[:, :, 2*fold:] = seq_features[:, :, 2*fold:]  # static
+            shifted[:, :-1, :fold] = seq_features[:, 1:, :fold]
+            shifted[:, 1:, fold:2*fold] = seq_features[:, :-1, fold:2*fold]
+            shifted[:, :, 2*fold:] = seq_features[:, :, 2*fold:]
 
-            # Conv1D along temporal dimension
-            x = shifted.transpose(1, 2) # (B, C, T)
-            feat = self.conv(x).squeeze(-1) # (B, 512)
+            x = shifted.transpose(1, 2)
+            feat = self.conv(x).squeeze(-1)
         return feat
 
 
 class POSrPPGExtractor:
-    """
-    Biological Branch: Plane-Orthogonal-to-Skin (POS) rPPG signal extractor from forehead ROI.
-    """
     def __init__(self, low_cutoff: float = 0.7, high_cutoff: float = 3.5):
         self.low_cutoff = low_cutoff
         self.high_cutoff = high_cutoff
 
     def extract_pos_rppg(self, forehead_crops: List[np.ndarray], fps: float = 8.0) -> np.ndarray:
-        """
-        Extracts POS rPPG pulse signal, spectral power, estimated heart rate (BPM), and SNR.
-        Returns 32-dim biological feature vector.
-        """
         if len(forehead_crops) < 4:
             return np.zeros(32, dtype=np.float32)
 
@@ -237,27 +197,24 @@ class POSrPPGExtractor:
         if len(rgb_series) < 4:
             return np.zeros(32, dtype=np.float32)
 
-        C = np.array(rgb_series) # (T, 3)
+        C = np.array(rgb_series)
         mean_C = np.mean(C, axis=0, keepdims=True) + 1e-8
         C_norm = C / mean_C
 
-        # POS formulation
-        S1 = C_norm[:, 1] - C_norm[:, 2] # G - B
-        S2 = C_norm[:, 1] + C_norm[:, 2] - 2.0 * C_norm[:, 0] # G + B - 2R
+        S1 = C_norm[:, 1] - C_norm[:, 2]
+        S2 = C_norm[:, 1] + C_norm[:, 2] - 2.0 * C_norm[:, 0]
 
         std_S1 = np.std(S1)
         std_S2 = np.std(S2) + 1e-8
         alpha = std_S1 / std_S2
 
-        H = S1 + alpha * S2 # Raw rPPG signal
+        H = S1 + alpha * S2
 
-        # Stats
         mean_h = float(np.mean(H))
         std_h = float(np.std(H))
         var_h = float(np.var(H))
         skew_h = float(np.mean((H - mean_h) ** 3) / (std_h ** 3 + 1e-8))
 
-        # FFT Analysis
         N = len(H)
         freqs = np.fft.rfftfreq(N, d=1.0/fps)
         fft_mag = np.abs(np.fft.rfft(H)) ** 2
@@ -273,7 +230,6 @@ class POSrPPGExtractor:
             bpm = 70.0
             snr = 0.0
 
-        # Construct 32D vector
         bio_vec = np.zeros(32, dtype=np.float32)
         bio_vec[0] = mean_h
         bio_vec[1] = std_h
@@ -281,7 +237,6 @@ class POSrPPGExtractor:
         bio_vec[3] = skew_h
         bio_vec[4] = bpm
         bio_vec[5] = snr
-        # Fill remaining dimensions with frequency spectrum samples
         spec_len = min(26, len(fft_mag))
         bio_vec[6:6+spec_len] = fft_mag[:spec_len]
 
@@ -291,22 +246,30 @@ class POSrPPGExtractor:
 # ==========================================
 # 3. Main Extraction Pipeline Script
 # ==========================================
-def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_frames_per_video: int = 16, max_videos: Optional[int] = None):
+def extract_dataset(data_dir: str, output_path: Optional[str] = None, augment: bool = True, max_frames_per_video: int = 16, max_videos: Optional[int] = None):
     """
     Processes dataset of MP4 videos, extracts fused features, and saves extracted_features.npz.
+    Dynamic path resolution handles Local vs Google Colab Drive storage automatically.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    out_file = os.path.join(output_dir, "extracted_features.npz")
+    resolved_data_dir = str(resolve_path(data_dir))
+    
+    if output_path is None:
+        target_npz_path = get_features_output_path("extracted_features.npz")
+    else:
+        target_npz_path = resolve_path(output_path)
 
-    # Safety First: Delete existing extracted_features.npz to prevent corruption
+    # Ensure parent output directory exists
+    target_npz_path.parent.mkdir(parents=True, exist_ok=True)
+    out_file = str(target_npz_path)
+
+    # Safety First: Clean existing output file
     if os.path.exists(out_file):
         logger.info(f"Safety Cleanup: Deleting existing output file: {out_file}")
         os.remove(out_file)
 
-    # Deduplication: Discover video paths, convert to absolute strings, set() deduplicate, sort
     raw_video_paths = []
     for ext in ["*.mp4", "*.MP4", "*.avi", "*.mov", "*.mkv"]:
-        raw_video_paths.extend(glob.glob(os.path.join(data_dir, "**", ext), recursive=True))
+        raw_video_paths.extend(glob.glob(os.path.join(resolved_data_dir, "**", ext), recursive=True))
 
     abs_paths = sorted(list({os.path.abspath(p) for p in raw_video_paths}))
     logger.info(f"Discovered and deduplicated dataset: Total {len(abs_paths)} unique videos found.")
@@ -316,19 +279,16 @@ def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_fr
         abs_paths = abs_paths[:max_videos]
 
     if len(abs_paths) == 0:
-        logger.warning(f"No video files found in '{data_dir}'. Generating synthetic dataset for demonstration pipeline.")
-        synthetic_dir = os.path.join(output_dir, "synthetic_videos")
+        logger.warning(f"No video files found in '{resolved_data_dir}'. Generating synthetic dataset.")
+        synthetic_dir = str(target_npz_path.parent / "synthetic_videos")
         os.makedirs(synthetic_dir, exist_ok=True)
         abs_paths = create_synthetic_videos(synthetic_dir, num_videos=10)
-        logger.info(f"Created {len(abs_paths)} synthetic videos for test extraction.")
 
-    # Initialize Modules
     face_processor = FaceProcessor(model_path="face_landmarker.task")
     spatial_extractor = SpatialExtractor().to(device)
     temporal_extractor = TemporalShiftModule().to(device)
     rppg_extractor = POSrPPGExtractor()
 
-    # Image Normalization for PyTorch models
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
     std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
@@ -340,9 +300,10 @@ def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_fr
     processed_paths = []
 
     for idx, v_path in enumerate(abs_paths):
-        logger.info(f"[{idx+1}/{len(abs_paths)}] Processing: {os.path.basename(v_path)}")
+        if (idx + 1) % 25 == 0 or idx == 0:
+            logger.info(f"[{idx+1}/{len(abs_paths)}] Processing: {os.path.basename(v_path)}")
+            
         cap = cv2.VideoCapture(v_path)
-        
         face_crops = []
         forehead_crops = []
         frames_count = 0
@@ -363,10 +324,8 @@ def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_fr
         cap.release()
 
         if len(face_crops) == 0:
-            logger.warning(f"No face detected in {v_path}. Skipping.")
             continue
 
-        # Prepare Tensors for Spatial Branch
         tensor_crops = []
         for fc in face_crops:
             fc_resized = cv2.resize(fc, (224, 224))
@@ -377,21 +336,15 @@ def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_fr
         batch_tensors = torch.stack(tensor_crops).to(device)
         batch_tensors = (batch_tensors - mean) / std
 
-        # 1. Spatial Features (EfficientNet-B0) -> average pooled across frames
-        spatial_feats = spatial_extractor(batch_tensors) # (T, 1280)
-        spatial_vec = spatial_feats.mean(dim=0).cpu().numpy() # (1280,)
+        spatial_feats = spatial_extractor(batch_tensors)
+        spatial_vec = spatial_feats.mean(dim=0).cpu().numpy()
 
-        # 2. Temporal Features (TSM) -> motion feature vector
-        seq_tensor = spatial_feats.unsqueeze(0) # (1, T, 1280)
-        temporal_vec = temporal_extractor(seq_tensor).squeeze(0).cpu().numpy() # (512,)
+        seq_tensor = spatial_feats.unsqueeze(0)
+        temporal_vec = temporal_extractor(seq_tensor).squeeze(0).cpu().numpy()
 
-        # 3. Biological Features (POS-rPPG)
-        bio_vec = rppg_extractor.extract_pos_rppg(forehead_crops) # (32,)
+        bio_vec = rppg_extractor.extract_pos_rppg(forehead_crops)
 
-        # Fused Vector
         fused_vec = np.concatenate([spatial_vec, temporal_vec, bio_vec], axis=0)
-
-        # Smart Label Determination using directory structure
         label = determine_label_from_path(v_path)
 
         spatial_features_list.append(spatial_vec)
@@ -407,7 +360,6 @@ def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_fr
 
     labels_arr = np.array(labels_list, dtype=np.float32)
 
-    # Save to compressed .npz
     np.savez_compressed(
         out_file,
         X=np.array(fused_features_list, dtype=np.float32),
@@ -424,7 +376,6 @@ def extract_dataset(data_dir: str, output_dir: str, augment: bool = True, max_fr
 
 
 def create_synthetic_videos(output_dir: str, num_videos: int = 10) -> List[str]:
-    """Helper to generate dummy MP4 videos if no real videos are present in data_dir."""
     paths = []
     for i in range(num_videos):
         filename = f"synthetic_{'fake' if i % 2 == 1 else 'real'}_{i:02d}.mp4"
@@ -450,9 +401,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Task 1: Multimodal Feature Extraction Script")
     parser.add_argument("--data_dir", type=str, default="data", help="Path to raw input videos directory")
-    parser.add_argument("--out_dir", type=str, default="features_out", help="Output directory for .npz features")
+    parser.add_argument("--out_path", type=str, default=None, help="Custom output .npz path")
     parser.add_argument("--no_augment", action="store_true", help="Disable noise augmentations")
-    parser.add_argument("--max_videos", type=int, default=None, help="Maximum videos to extract (None for all)")
+    parser.add_argument("--max_videos", type=int, default=None, help="Maximum videos to extract")
     args = parser.parse_args()
 
-    extract_dataset(args.data_dir, args.out_dir, augment=not args.no_augment, max_videos=args.max_videos)
+    extract_dataset(args.data_dir, args.out_path, augment=not args.no_augment, max_videos=args.max_videos)

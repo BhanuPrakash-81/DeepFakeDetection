@@ -6,9 +6,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc, precision_score, recall_score, f1_score, confusion_matrix
 import torch
-from typing import Tuple
+from typing import Tuple, Optional
 
 from model_and_train import MultimodalGatedAttentionAdapter, MultimodalDataset
+from utils.paths import get_features_output_path, get_checkpoint_path, get_eval_output_path, resolve_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -19,12 +20,6 @@ logger.info(f"Using device: {device}")
 
 
 def compute_eer(y_true: np.ndarray, y_scores: np.ndarray) -> Tuple[float, float]:
-    """
-    Explicit mathematical calculation of Equal Error Rate (EER) where FPR == FNR.
-    Returns:
-        eer: Equal Error Rate percentage
-        threshold: Optimal decision threshold where FPR == FNR
-    """
     if len(np.unique(y_true)) < 2:
         logger.warning("y_true contains only 1 class. Equal Error Rate calculation defaults to 0.0.")
         return 0.0, 0.5
@@ -44,46 +39,45 @@ def compute_eer(y_true: np.ndarray, y_scores: np.ndarray) -> Tuple[float, float]
 
 
 def evaluate_model(
-    npz_path: str = "features_out/extracted_features.npz",
-    model_path: str = "attention_adapter.pth",
-    output_roc_path: str = "roc_curve.png"
+    npz_path: Optional[str] = None,
+    model_path: Optional[str] = None,
+    output_roc_path: Optional[str] = None
 ):
-    """
-    Evaluates trained MultimodalGatedAttentionAdapter model on test/validation .npz features,
-    calculates academic metrics (AUC-ROC, EER, F1, Precision, Recall), plots ROC curve,
-    and benchmarks throughput latency/FPS.
-    """
-    if not os.path.exists(npz_path):
-        logger.warning(f"File '{npz_path}' not found. Generating synthetic test dataset for metric evaluation.")
-        os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
-        from model_and_train import create_dummy_npz
-        create_dummy_npz(npz_path, num_samples=120)
+    target_npz = get_features_output_path("extracted_features.npz") if npz_path is None else resolve_path(npz_path)
+    target_ckpt = get_checkpoint_path("attention_adapter.pth") if model_path is None else resolve_path(model_path)
+    target_roc = get_eval_output_path("roc_curve.png") if output_roc_path is None else resolve_path(output_roc_path)
 
-    # Load dataset
-    dataset = MultimodalDataset(npz_path)
+    target_roc.parent.mkdir(parents=True, exist_ok=True)
+    str_npz = str(target_npz)
+    str_ckpt = str(target_ckpt)
+    str_roc = str(target_roc)
+
+    if not os.path.exists(str_npz):
+        logger.warning(f"File '{str_npz}' not found. Generating synthetic test dataset.")
+        from model_and_train import create_dummy_npz
+        create_dummy_npz(str_npz, num_samples=120)
+
+    dataset = MultimodalDataset(str_npz)
     X_tensor = dataset.X.to(device)
     y_true = dataset.y.numpy()
 
-    # Load model
     model = MultimodalGatedAttentionAdapter(
         spatial_dim=dataset.spatial_dim,
         temporal_dim=dataset.temporal_dim,
         biological_dim=dataset.biological_dim
     ).to(device)
 
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        logger.info(f"Successfully loaded model checkpoint from '{model_path}'")
+    if os.path.exists(str_ckpt):
+        model.load_state_dict(torch.load(str_ckpt, map_location=device))
+        logger.info(f"Successfully loaded model checkpoint from '{str_ckpt}'")
     else:
-        logger.warning(f"Checkpoint '{model_path}' not found. Evaluating on raw initialized weights.")
+        logger.warning(f"Checkpoint '{str_ckpt}' not found. Evaluating on raw weights.")
 
     model.eval()
 
-    # Warmup pass
     with torch.no_grad():
         _ = model(X_tensor[:min(5, len(X_tensor))])
 
-    # Benchmark Throughput Latency
     num_samples = len(X_tensor)
     start_t = time.time()
     with torch.no_grad():
@@ -95,7 +89,6 @@ def evaluate_model(
     latency_per_sample_ms = (total_time_sec / max(num_samples, 1)) * 1000.0
     throughput_fps = num_samples / max(total_time_sec, 1e-6)
 
-    # 1. AUC-ROC Curve Calculation & Plotting
     if len(np.unique(y_true)) >= 2:
         fpr, tpr, thresholds = roc_curve(y_true, probs)
         roc_auc = auc(fpr, tpr)
@@ -114,24 +107,20 @@ def evaluate_model(
     plt.legend(loc="lower right", fontsize=11)
     plt.grid(True, linestyle=":", alpha=0.6)
     plt.tight_layout()
-    plt.savefig(output_roc_path, dpi=300)
+    plt.savefig(str_roc, dpi=300)
     plt.close()
-    logger.info(f"Saved ROC curve plot to '{output_roc_path}'")
+    logger.info(f"Saved ROC curve plot to '{str_roc}'")
 
-    # 2. Equal Error Rate (EER) Calculation
     eer, eer_threshold = compute_eer(y_true, probs)
 
-    # 3. Standard Classification Metrics
     y_pred = (probs >= 0.5).astype(int)
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
     cm = confusion_matrix(y_true, y_pred)
 
-    # Mean Modality Attention Weights
     mean_weights = attn_weights.mean(dim=0).cpu().numpy()
 
-    # Print Academic Summary Report
     print("\n" + "="*70)
     print("      ACADEMIC EVALUATION REPORT: MULTIMODAL DEEPFAKE DETECTION      ")
     print("="*70)
@@ -160,9 +149,9 @@ def evaluate_model(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Task 4: Academic Metrics Evaluation Script")
-    parser.add_argument("--features", type=str, default="features_out/extracted_features.npz", help="Path to test .npz dataset")
-    parser.add_argument("--model", type=str, default="attention_adapter.pth", help="Path to trained PyTorch checkpoint")
-    parser.add_argument("--roc_plot", type=str, default="roc_curve.png", help="Path to save ROC curve image")
+    parser.add_argument("--features", type=str, default=None, help="Path to test .npz dataset")
+    parser.add_argument("--model", type=str, default=None, help="Path to trained checkpoint")
+    parser.add_argument("--roc_plot", type=str, default=None, help="Path to save ROC curve")
     args = parser.parse_args()
 
     evaluate_model(

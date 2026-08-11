@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Dict, Any, Optional
 
+from utils.paths import get_features_output_path, get_checkpoint_path, resolve_path
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ModelAndTrain")
@@ -63,65 +65,50 @@ class MultimodalGatedAttentionAdapter(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # Dynamic Gating Network: Evaluates concatenated representations and outputs 3 attention logits
-        # Concatenated latent dimension = 3 * 256 = 768
+        # Dynamic Gating Network
         self.gating_network = nn.Sequential(
             nn.Linear(latent_dim * 3, 128),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 3) # Logits for [Spatial, Temporal, Biological]
+            nn.Linear(128, 3)
         )
 
-        # Classification Head on Modulated Latent Features
+        # Classification Head
         self.cls_head = nn.Sequential(
             nn.Linear(latent_dim * 3, 128),
             nn.BatchNorm1d(128),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 1) # Binary classification logit
+            nn.Linear(128, 1)
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x: (Batch, spatial_dim + temporal_dim + biological_dim) concatenated vector
-        Returns:
-            logits: (Batch,) raw classification logit
-            attention_weights: (Batch, 3) Softmax weights [w_S, w_T, w_B]
-        """
         if x.dim() == 1:
             x = x.unsqueeze(0)
 
-        # Slice input vector into individual branch representations
         x_S = x[:, :self.spatial_dim]
         x_T = x[:, self.spatial_dim:self.spatial_dim + self.temporal_dim]
         x_B = x[:, self.spatial_dim + self.temporal_dim:]
 
-        # Project into shared latent space
-        h_S = self.proj_spatial(x_S)  # (B, 256)
-        h_T = self.proj_temporal(x_T)  # (B, 256)
-        h_B = self.proj_biological(x_B) # (B, 256)
+        h_S = self.proj_spatial(x_S)
+        h_T = self.proj_temporal(x_T)
+        h_B = self.proj_biological(x_B)
 
-        # Concatenate latent representations for gating evaluation
-        h_cat = torch.cat([h_S, h_T, h_B], dim=-1) # (B, 768)
+        h_cat = torch.cat([h_S, h_T, h_B], dim=-1)
 
-        # Compute dynamic gating logits & Softmax attention weights
-        gate_logits = self.gating_network(h_cat) # (B, 3)
-        attn_weights = F.softmax(gate_logits, dim=-1) # (B, 3) -> [w_S, w_T, w_B]
+        gate_logits = self.gating_network(h_cat)
+        attn_weights = F.softmax(gate_logits, dim=-1)
 
-        # Modulate latent features with dynamic attention weights
-        w_S = attn_weights[:, 0:1] # (B, 1)
-        w_T = attn_weights[:, 1:2] # (B, 1)
-        w_B = attn_weights[:, 2:3] # (B, 1)
+        w_S = attn_weights[:, 0:1]
+        w_T = attn_weights[:, 1:2]
+        w_B = attn_weights[:, 2:3]
 
         h_S_weighted = h_S * w_S
         h_T_weighted = h_T * w_T
         h_B_weighted = h_B * w_B
 
-        # Fuse weighted features
-        h_fused = torch.cat([h_S_weighted, h_T_weighted, h_B_weighted], dim=-1) # (B, 768)
-
-        # Final binary classification logit
-        logits = self.cls_head(h_fused).squeeze(-1) # (B,)
+        h_fused = torch.cat([h_S_weighted, h_T_weighted, h_B_weighted], dim=-1)
+        logits = self.cls_head(h_fused).squeeze(-1)
 
         return logits, attn_weights
 
@@ -132,7 +119,8 @@ class MultimodalGatedAttentionAdapter(nn.Module):
 class MultimodalDataset(Dataset):
     """PyTorch Dataset loading fused .npz feature vectors."""
     def __init__(self, npz_path: str):
-        data = np.load(npz_path)
+        resolved_npz = str(resolve_path(npz_path))
+        data = np.load(resolved_npz)
         self.X = torch.tensor(data["X"], dtype=torch.float32)
         self.y = torch.tensor(data["y"], dtype=torch.float32)
         self.spatial_dim = int(data.get("spatial_dim", 1280))
@@ -147,23 +135,31 @@ class MultimodalDataset(Dataset):
 
 
 def train_adapter(
-    npz_path: str = "features_out/extracted_features.npz",
-    save_path: str = "attention_adapter.pth",
-    epochs: int = 50,
+    npz_path: Optional[str] = None,
+    save_path: Optional[str] = None,
+    epochs: int = 30,
     batch_size: int = 16,
     lr: float = 1e-3,
     val_split: float = 0.2
 ):
     """
-    Trains the MultimodalGatedAttentionAdapter on extracted .npz features with train/val split.
+    Trains MultimodalGatedAttentionAdapter on extracted .npz features with train/val split.
+    Dynamic path resolution routes model outputs to Local ./outputs or Google Drive automatically.
     """
-    if not os.path.exists(npz_path):
-        logger.warning(f"Feature file '{npz_path}' not found. Creating synthetic dataset for demonstration training.")
-        os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
-        create_dummy_npz(npz_path, num_samples=100)
+    target_npz = get_features_output_path("extracted_features.npz") if npz_path is None else resolve_path(npz_path)
+    target_ckpt = get_checkpoint_path("attention_adapter.pth") if save_path is None else resolve_path(save_path)
 
-    dataset = MultimodalDataset(npz_path)
-    val_size = int(len(dataset) * val_split)
+    # Ensure parent checkpoint directory exists
+    target_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    str_npz_path = str(target_npz)
+    str_ckpt_path = str(target_ckpt)
+
+    if not os.path.exists(str_npz_path):
+        logger.warning(f"Feature file '{str_npz_path}' not found. Creating synthetic dataset.")
+        create_dummy_npz(str_npz_path, num_samples=100)
+
+    dataset = MultimodalDataset(str_npz_path)
+    val_size = max(1, int(len(dataset) * val_split))
     train_size = len(dataset) - val_size
 
     train_ds, val_ds = torch.utils.data.random_split(
@@ -187,11 +183,8 @@ def train_adapter(
     logger.info(f"Starting training for {epochs} epochs on {train_size} train, {val_size} val samples...")
 
     for epoch in range(1, epochs + 1):
-        # Training Phase
         model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+        train_loss, train_correct, train_total = 0.0, 0, 0
 
         for X_b, y_b in train_loader:
             X_b, y_b = X_b.to(device), y_b.to(device)
@@ -211,11 +204,8 @@ def train_adapter(
         train_loss /= train_total
         train_acc = train_correct / train_total
 
-        # Validation Phase
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
+        val_loss, val_correct, val_total = 0.0, 0, 0
         avg_weights = np.zeros(3)
 
         with torch.no_grad():
@@ -228,7 +218,6 @@ def train_adapter(
                 preds = (torch.sigmoid(logits) >= 0.5).float()
                 val_correct += (preds == y_b).sum().item()
                 val_total += len(y_b)
-
                 avg_weights += attn.mean(dim=0).cpu().numpy() * len(y_b)
 
         val_loss /= max(val_total, 1)
@@ -245,25 +234,22 @@ def train_adapter(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
-            logger.info(f"Saved best model checkpoint to '{save_path}' (Val Loss: {val_loss:.4f})")
+            torch.save(model.state_dict(), str_ckpt_path)
+            logger.info(f"Saved best model checkpoint to '{str_ckpt_path}' (Val Loss: {val_loss:.4f})")
 
     logger.info("Training pipeline completed successfully.")
 
 
 def create_dummy_npz(filepath: str, num_samples: int = 100):
-    """Creates synthetic .npz feature file for training pipeline testing."""
     spatial_dim, temporal_dim, biological_dim = 1280, 512, 32
     X_spatial = np.random.randn(num_samples, spatial_dim).astype(np.float32)
     X_temporal = np.random.randn(num_samples, temporal_dim).astype(np.float32)
     X_biological = np.random.randn(num_samples, biological_dim).astype(np.float32)
 
-    # Corrupt some biological signals with heavy noise to test gating neglect
-    X_biological[::3] = np.random.randn(biological_dim).astype(np.float32) * 50.0
-
     X_fused = np.concatenate([X_spatial, X_temporal, X_biological], axis=1)
-    y = np.random.randint(0, 2, size=num_samples).astype(np.int32)
+    y = np.random.randint(0, 2, size=num_samples).astype(np.float32)
 
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     np.savez_compressed(
         filepath,
         X=X_fused,
@@ -281,8 +267,8 @@ def create_dummy_npz(filepath: str, num_samples: int = 100):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Task 2: Attention Adapter Training Pipeline")
-    parser.add_argument("--features", type=str, default="features_out/extracted_features.npz", help="Path to .npz dataset")
-    parser.add_argument("--save_path", type=str, default="attention_adapter.pth", help="Checkpoint output path")
+    parser.add_argument("--features", type=str, default=None, help="Path to .npz dataset")
+    parser.add_argument("--save_path", type=str, default=None, help="Checkpoint output path")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
