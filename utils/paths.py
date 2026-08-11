@@ -35,8 +35,18 @@ def resolve_path(relative_path: Union[str, Path]) -> Path:
     return (PROJECT_ROOT / path_obj).resolve()
 
 def get_features_output_path(filename: str = "extracted_features.npz") -> Path:
-    """Returns path for extracted .npz features inside environment output dir."""
-    out_dir = get_base_output_dir() / "features"
+    """
+    Returns path for extracted .npz features.
+    Checks Drive root (/content/drive/MyDrive/extracted_features.npz) first on Colab.
+    """
+    if IS_COLAB:
+        drive_root_file = COLAB_DRIVE_DIR / filename
+        if drive_root_file.exists():
+            return drive_root_file
+        out_dir = COLAB_DRIVE_DIR / "DeepFake_Outputs" / "features"
+    else:
+        out_dir = get_base_output_dir() / "features"
+        
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / filename
 

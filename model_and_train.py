@@ -145,41 +145,43 @@ class MultimodalGatedAttentionAdapter(nn.Module):
 
 
 # ==========================================
-# 3. PyTorch Dataset & Training Loop
+# 3. PyTorch Dataset & DataLoader Integration
 # ==========================================
 class MultimodalDataset(Dataset):
     """
-    PyTorch Dataset loading real fused .npz feature vectors.
-    Flexibly unpacks 'X' or 'features', and 'y' or 'labels'.
+    PyTorch Dataset loading real fused .npz feature matrix.
+    Extracts features using key 'X' (shape: (N, 1824)) and labels using key 'y' (shape: (N,)).
     Raises explicit FileNotFoundError if dataset path does not exist.
     """
     def __init__(self, npz_path: str):
         resolved_npz = str(resolve_path(npz_path))
+        
+        # Drive root fallback check for Google Colab
+        if not os.path.exists(resolved_npz) and os.path.exists("/content/drive/MyDrive/extracted_features.npz"):
+            resolved_npz = "/content/drive/MyDrive/extracted_features.npz"
+
         if not os.path.exists(resolved_npz):
             raise FileNotFoundError(
-                f"ERROR: Dataset file not found at '{resolved_npz}'.\n"
-                f"Colab Drive Location : /content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz\n"
-                f"Local Machine Location: ./outputs/features/extracted_features.npz\n"
+                f"ERROR: Extracted dataset file not found at '{resolved_npz}'.\n"
+                f"Checked Locations:\n"
+                f" - /content/drive/MyDrive/extracted_features.npz\n"
+                f" - /content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz\n"
+                f" - ./outputs/features/extracted_features.npz\n"
                 f"Please ensure Stage 1 (extract_features.py) has completed successfully!"
             )
 
         data = np.load(resolved_npz)
 
-        # Unpack feature matrix (support 'X' or 'features')
+        # Exact Archive Key Mapping: 'X' for features, 'y' for labels
         if "X" in data:
             self.X = torch.tensor(data["X"], dtype=torch.float32)
-        elif "features" in data:
-            self.X = torch.tensor(data["features"], dtype=torch.float32)
         else:
-            raise KeyError(f"Neither 'X' nor 'features' key found in {resolved_npz}. Keys present: {list(data.keys())}")
+            raise KeyError(f"Key 'X' missing in {resolved_npz}. Available keys: {list(data.keys())}")
 
-        # Unpack labels (support 'y' or 'labels')
         if "y" in data:
             self.y = torch.tensor(data["y"], dtype=torch.float32)
-        elif "labels" in data:
-            self.y = torch.tensor(data["labels"], dtype=torch.float32)
         else:
-            raise KeyError(f"Neither 'y' nor 'labels' key found in {resolved_npz}. Keys present: {list(data.keys())}")
+            raise KeyError(f"Key 'y' missing in {resolved_npz}. Available keys: {list(data.keys())}")
 
         self.spatial_dim = int(data.get("spatial_dim", 1280))
         self.temporal_dim = int(data.get("temporal_dim", 512))
@@ -204,8 +206,8 @@ def train_adapter(
     weight_decay: float = 1e-4
 ):
     """
-    Trains MultimodalGatedAttentionAdapter with Dropout, Weight Decay (L2), and Early Stopping.
-    Prevents overfitting when fine-tuning on feature vectors.
+    Trains MultimodalGatedAttentionAdapter on extracted .npz features with train/val split.
+    Uses exact key mapping ('X', 'y'), Dropout (p=0.4), Weight Decay (1e-4), and EarlyStopping (patience=7).
     """
     target_npz = get_features_output_path("extracted_features.npz") if npz_path is None else resolve_path(npz_path)
     target_ckpt = get_checkpoint_path("attention_adapter.pth") if save_path is None else resolve_path(save_path)
@@ -213,19 +215,25 @@ def train_adapter(
     str_npz_path = str(target_npz)
     str_ckpt_path = str(target_ckpt)
 
+    # Colab Drive root fallback check
+    if not os.path.exists(str_npz_path) and os.path.exists("/content/drive/MyDrive/extracted_features.npz"):
+        str_npz_path = "/content/drive/MyDrive/extracted_features.npz"
+
     if not os.path.exists(str_npz_path):
         raise FileNotFoundError(
             f"ERROR: Extracted features file not found at: '{str_npz_path}'\n"
-            f"Expected Google Drive Location (Colab): '/content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz'\n"
-            f"Expected Local Location: './outputs/features/extracted_features.npz'\n"
-            f"Please run Stage 1 (extract_features.py) first to extract the feature vectors!"
+            f"Expected Locations:\n"
+            f" - Colab Drive Root: '/content/drive/MyDrive/extracted_features.npz'\n"
+            f" - Colab Drive Subfolder: '/content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz'\n"
+            f" - Local Machine: './outputs/features/extracted_features.npz'\n"
+            f"Please run Stage 1 (extract_features.py) first to extract feature vectors!"
         )
 
     # Ensure parent checkpoint directory exists
     target_ckpt.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = MultimodalDataset(str_npz_path)
-    logger.info(f"Loaded Real Dataset '{str_npz_path}' | Samples: {len(dataset)} | Feature Dim: {dataset.X.shape[1]}")
+    logger.info(f"Loaded Real Dataset '{str_npz_path}' | Samples: {len(dataset)} | Feature Matrix X: {dataset.X.shape}")
 
     val_size = max(1, int(len(dataset) * val_split))
     train_size = len(dataset) - val_size
@@ -237,7 +245,6 @@ def train_adapter(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    # Model with Dropout Regularization
     model = MultimodalGatedAttentionAdapter(
         spatial_dim=dataset.spatial_dim,
         temporal_dim=dataset.temporal_dim,
@@ -245,12 +252,10 @@ def train_adapter(
         dropout=dropout
     ).to(device)
 
-    # Loss & Optimizer with L2 Regularization (Weight Decay = 1e-4)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # Initialize Early Stopping
     early_stopping = EarlyStopping(patience=patience)
 
     logger.info(f"Starting training (Max Epochs: {epochs}, Patience: {patience}, Dropout: {dropout}, WeightDecay: {weight_decay})...")
@@ -305,7 +310,6 @@ def train_adapter(
             f"Weights -> S: {avg_weights[0]:.2f}, T: {avg_weights[1]:.2f}, B: {avg_weights[2]:.2f}"
         )
 
-        # Check Early Stopping & Save Best Checkpoint
         is_best = early_stopping(val_loss, epoch)
         if is_best:
             torch.save(model.state_dict(), str_ckpt_path)
@@ -315,12 +319,10 @@ def train_adapter(
             logger.info(f"Early stopping triggered at Epoch {epoch}! Best Val Loss: {early_stopping.best_loss:.4f} at Epoch {early_stopping.best_epoch}.")
             break
 
-    # Restore best checkpoint weights at end of training
+    # Restore optimal checkpoint
     if os.path.exists(str_ckpt_path):
         model.load_state_dict(torch.load(str_ckpt_path, map_location=device))
         logger.info(f"Loaded optimal checkpoint weights from epoch {early_stopping.best_epoch}.")
-
-    logger.info("Training pipeline completed successfully.")
 
 
 if __name__ == "__main__":
