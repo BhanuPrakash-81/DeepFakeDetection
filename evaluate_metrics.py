@@ -53,9 +53,12 @@ def evaluate_model(
     str_roc = str(target_roc)
 
     if not os.path.exists(str_npz):
-        logger.warning(f"File '{str_npz}' not found. Generating synthetic test dataset.")
-        from model_and_train import create_dummy_npz
-        create_dummy_npz(str_npz, num_samples=120)
+        raise FileNotFoundError(
+            f"ERROR: Dataset features file not found at '{str_npz}'.\n"
+            f"Colab Drive Location : /content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz\n"
+            f"Local Machine Location: ./outputs/features/extracted_features.npz\n"
+            f"Please run Stage 1 (extract_features.py) first to generate the dataset!"
+        )
 
     dataset = MultimodalDataset(str_npz)
     X_tensor = dataset.X.to(device)

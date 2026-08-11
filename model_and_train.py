@@ -117,12 +117,39 @@ class MultimodalGatedAttentionAdapter(nn.Module):
 # 2. PyTorch Dataset & Training Loop
 # ==========================================
 class MultimodalDataset(Dataset):
-    """PyTorch Dataset loading fused .npz feature vectors."""
+    """
+    PyTorch Dataset loading real fused .npz feature vectors.
+    Flexibly unpacks 'X' or 'features', and 'y' or 'labels'.
+    Raises explicit FileNotFoundError if dataset path does not exist.
+    """
     def __init__(self, npz_path: str):
         resolved_npz = str(resolve_path(npz_path))
+        if not os.path.exists(resolved_npz):
+            raise FileNotFoundError(
+                f"ERROR: Dataset file not found at '{resolved_npz}'.\n"
+                f"Colab Drive Location : /content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz\n"
+                f"Local Machine Location: ./outputs/features/extracted_features.npz\n"
+                f"Please ensure Stage 1 (extract_features.py) has completed successfully!"
+            )
+
         data = np.load(resolved_npz)
-        self.X = torch.tensor(data["X"], dtype=torch.float32)
-        self.y = torch.tensor(data["y"], dtype=torch.float32)
+
+        # Unpack feature matrix (support 'X' or 'features')
+        if "X" in data:
+            self.X = torch.tensor(data["X"], dtype=torch.float32)
+        elif "features" in data:
+            self.X = torch.tensor(data["features"], dtype=torch.float32)
+        else:
+            raise KeyError(f"Neither 'X' nor 'features' key found in {resolved_npz}. Keys present: {list(data.keys())}")
+
+        # Unpack labels (support 'y' or 'labels')
+        if "y" in data:
+            self.y = torch.tensor(data["y"], dtype=torch.float32)
+        elif "labels" in data:
+            self.y = torch.tensor(data["labels"], dtype=torch.float32)
+        else:
+            raise KeyError(f"Neither 'y' nor 'labels' key found in {resolved_npz}. Keys present: {list(data.keys())}")
+
         self.spatial_dim = int(data.get("spatial_dim", 1280))
         self.temporal_dim = int(data.get("temporal_dim", 512))
         self.biological_dim = int(data.get("biological_dim", 32))
@@ -144,21 +171,29 @@ def train_adapter(
 ):
     """
     Trains MultimodalGatedAttentionAdapter on extracted .npz features with train/val split.
-    Dynamic path resolution routes model outputs to Local ./outputs or Google Drive automatically.
+    Strictly requires the real dataset; saves model weights directly to Google Drive (Colab) or Local outputs.
     """
     target_npz = get_features_output_path("extracted_features.npz") if npz_path is None else resolve_path(npz_path)
     target_ckpt = get_checkpoint_path("attention_adapter.pth") if save_path is None else resolve_path(save_path)
 
-    # Ensure parent checkpoint directory exists
-    target_ckpt.parent.mkdir(parents=True, exist_ok=True)
     str_npz_path = str(target_npz)
     str_ckpt_path = str(target_ckpt)
 
+    # Strictly require real .npz dataset file; NO fallback creation during production training!
     if not os.path.exists(str_npz_path):
-        logger.warning(f"Feature file '{str_npz_path}' not found. Creating synthetic dataset.")
-        create_dummy_npz(str_npz_path, num_samples=100)
+        raise FileNotFoundError(
+            f"ERROR: Extracted features file not found at: '{str_npz_path}'\n"
+            f"Expected Google Drive Location (Colab): '/content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz'\n"
+            f"Expected Local Location: './outputs/features/extracted_features.npz'\n"
+            f"Please run Stage 1 (extract_features.py) first to extract the feature vectors!"
+        )
+
+    # Ensure parent checkpoint directory exists
+    target_ckpt.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = MultimodalDataset(str_npz_path)
+    logger.info(f"Loaded Real Dataset '{str_npz_path}' | Samples: {len(dataset)} | Feature Dim: {dataset.X.shape[1]}")
+
     val_size = max(1, int(len(dataset) * val_split))
     train_size = len(dataset) - val_size
 
@@ -238,30 +273,6 @@ def train_adapter(
             logger.info(f"Saved best model checkpoint to '{str_ckpt_path}' (Val Loss: {val_loss:.4f})")
 
     logger.info("Training pipeline completed successfully.")
-
-
-def create_dummy_npz(filepath: str, num_samples: int = 100):
-    spatial_dim, temporal_dim, biological_dim = 1280, 512, 32
-    X_spatial = np.random.randn(num_samples, spatial_dim).astype(np.float32)
-    X_temporal = np.random.randn(num_samples, temporal_dim).astype(np.float32)
-    X_biological = np.random.randn(num_samples, biological_dim).astype(np.float32)
-
-    X_fused = np.concatenate([X_spatial, X_temporal, X_biological], axis=1)
-    y = np.random.randint(0, 2, size=num_samples).astype(np.float32)
-
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    np.savez_compressed(
-        filepath,
-        X=X_fused,
-        X_spatial=X_spatial,
-        X_temporal=X_temporal,
-        X_biological=X_biological,
-        y=y,
-        spatial_dim=spatial_dim,
-        temporal_dim=temporal_dim,
-        biological_dim=biological_dim
-    )
-    logger.info(f"Created synthetic dataset at '{filepath}' with shape {X_fused.shape}")
 
 
 if __name__ == "__main__":
