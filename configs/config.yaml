@@ -1,0 +1,88 @@
+# DeepFake Detection System Configuration (CPU Optimized)
+
+# Video Sampling & Preprocessing
+video:
+  target_fps: 3.0              # Strictly set to 3.0 FPS (range 2 to 5 FPS) for memory safety on CPU
+  max_frames: 60               # Cap max frames to prevent RAM overflow on 16GB CPU
+  spatial_size: [224, 224]     # Standard image input size for visual encoder
+  face_crop_margin: 0.2        # Bounding box expansion margin around detected face
+  roi_margin: 0.15             # Margin around facial feature ROIs
+
+# Pretrained Models & Landmark Detection
+landmarks:
+  model_url: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+  model_filename: "face_landmarker.task"
+  num_faces: 1
+  min_face_detection_confidence: 0.5
+  min_face_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
+
+# Visual Feature Extraction
+visual_encoder:
+  backbone: "mobilenet_v3_small" # CPU-optimized lightweight frozen backbone
+  pretrained: true
+  freeze_weights: true
+  roi_image_size: [112, 112]   # Size to crop and resize each facial ROI (eyes, nose, mouth)
+  batch_size: 16               # Batch size for batched ROI inference across frames
+
+# Biomechanics Feature Parameters
+biomechanics:
+  smoothing_window: 7          # Savitzky-Golay filter window size (odd integer)
+  poly_order: 2                # Savitzky-Golay polynomial order
+  normalize_scale: true        # Scale displacement relative to face size (inter-pupillary distance)
+  compute_derivatives:         # Derivatives to compute
+    - displacement
+    - velocity
+    - acceleration
+    - jerk
+
+# Physiological rPPG Parameters
+rppg:
+  algorithm: "POS"             # Default algorithm: POS or CHROM
+  fps: 3.0                     # Sampling rate matching video sample FPS (3.0 FPS)
+  low_cutoff_hz: 0.7           # ~42 BPM
+  high_cutoff_hz: 3.5          # ~210 BPM
+  filter_order: 4              # Butterworth bandpass filter order
+  skin_rois:                   # Skin regions for rPPG signal extraction
+    - forehead
+    - left_cheek
+    - right_cheek
+
+# Feature Fusion & Ablation Experiments
+fusion:
+  imputation_strategy: "median"
+  scaling: "standard"
+  experiments:
+    exp_A: "visual_face_only"
+    exp_B: "visual_parts_only"
+    exp_C: "visual_parts_biomechanics"
+    exp_D: "visual_parts_rppg"
+    exp_E: "full_model"        # Visual parts + Biomechanics + rPPG
+
+# Classifier Settings: PEFT PyTorch Anatomical Adapter
+classifier:
+  type: "pytorch_adapter"      # PEFT Lightweight Anatomical Adapter trained with SupCon + BCE Loss
+  pytorch_adapter_params:
+    hidden_dim: 256
+    proj_dim: 128
+    dropout: 0.3
+    epochs: 30
+    batch_size: 16
+    learning_rate: 0.001
+    alpha_supcon: 0.5          # Weight coefficient for Supervised Contrastive Loss
+    temperature: 0.07          # Temperature scaling parameter for SupCon Loss
+    weight_decay: 0.0001
+  xgboost_params:
+    n_estimators: 150
+    max_depth: 4
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    objective: "binary:logistic"
+    eval_metric: "logloss"
+    random_state: 42
+
+# Hardware & System Config
+hardware:
+  device: "cpu"                # Force CPU mode for local Intel i5 / 16GB RAM environment
+  num_workers: 0               # 0 num_workers for thread safety on Windows CPU

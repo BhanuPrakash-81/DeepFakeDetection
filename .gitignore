@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datasets and extracted features
+data/
+features_out/
+*.npz
+
+# Model checkpoints & large assets
+*.pth
+*.task
+*.png
+
+# Environments
+venv/
+.venv/
+env/
+.env
+
+# IDE / Editor files
+.idea/
+.vscode/
+.DS_Store
