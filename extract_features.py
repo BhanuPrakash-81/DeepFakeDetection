@@ -173,7 +173,7 @@ class TemporalShiftModule(nn.Module):
     Dynamically accepts spatial feature channel dimension (e.g. 2048 or 1280)
     and projects into a robust 512-dim temporal feature vector.
     """
-    def __init__(self, in_channels: int = 1280, out_channels: int = 512, n_div: int = 8):
+    def __init__(self, in_channels: int = 2048, out_channels: int = 512, n_div: int = 8):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -191,6 +191,11 @@ class TemporalShiftModule(nn.Module):
     def forward(self, seq_features: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             B, T, C = seq_features.shape
+            # Dynamic Channel Adaptation Safety Guarantee
+            if self.conv[0].in_channels != C:
+                self.conv[0] = nn.Conv1d(C, self.out_channels, kernel_size=3, padding=1).to(seq_features.device)
+                self.conv.eval()
+
             if T <= 1:
                 if C >= self.out_channels:
                     return seq_features.mean(dim=1)[:, :self.out_channels]
@@ -321,7 +326,7 @@ def extract_dataset(data_dir: str, output_path: Optional[str] = None, augment: b
 
     face_processor = FaceProcessor(model_path="face_landmarker.task")
     spatial_extractor = SpatialExtractor().to(device)
-    temporal_extractor = TemporalShiftModule().to(device)
+    temporal_extractor = TemporalShiftModule(in_channels=spatial_extractor.feature_dim).to(device)
     rppg_extractor = POSrPPGExtractor()
 
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
