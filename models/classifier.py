@@ -39,7 +39,7 @@ class BaseClassifier(ABC):
 
 class PyTorchAdapterWrapper(BaseClassifier):
     """Wrapper for LightweightAnatomicalAdapter PyTorch model."""
-    def __init__(self, input_dim: int = 9281, params: Optional[Dict[str, Any]] = None):
+    def __init__(self, input_dim: int = 1824, params: Optional[Dict[str, Any]] = None):
         from models.adapter import LightweightAnatomicalAdapter
         params = params or {}
         hidden_dim = params.get("hidden_dim", 256)

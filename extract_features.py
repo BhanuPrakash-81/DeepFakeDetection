@@ -225,7 +225,9 @@ class POSrPPGExtractor:
             valid_mag = fft_mag[valid_mask]
             peak_idx = np.argmax(valid_mag)
             bpm = float(valid_freqs[peak_idx] * 60.0)
-            snr = float(10.0 * np.log10(valid_mag[peak_idx] / (np.sum(valid_mag) - valid_mag[peak_idx] + 1e-8)))
+            denom = (np.sum(valid_mag) - valid_mag[peak_idx]) + 1e-8
+            ratio = max(float(valid_mag[peak_idx] / denom), 1e-8)
+            snr = float(10.0 * np.log10(ratio))
         else:
             bpm = 70.0
             snr = 0.0
@@ -240,6 +242,7 @@ class POSrPPGExtractor:
         spec_len = min(26, len(fft_mag))
         bio_vec[6:6+spec_len] = fft_mag[:spec_len]
 
+        bio_vec = np.nan_to_num(bio_vec, nan=0.0, posinf=0.0, neginf=0.0)
         return bio_vec
 
 

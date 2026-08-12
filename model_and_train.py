@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
+from sklearn.metrics import roc_auc_score
 
 from utils.paths import get_features_output_path, get_checkpoint_path, resolve_path
 
@@ -20,45 +21,141 @@ logger.info(f"Using device: {device}")
 
 
 # ==========================================
-# 1. Early Stopping Utility
+# 1. Early Stopping Utility (Validation Loss & AUC-ROC)
 # ==========================================
-class EarlyStopping:
+class EarlyStoppingAUC:
     """
-    Early Stopping mechanism to monitor validation loss during training.
-    Stops training early if validation loss does not improve after `patience` consecutive epochs,
-    preventing over-fitting and saving model generalization performance.
+    Upgraded Early Stopping mechanism monitoring Validation AUC-ROC.
+    Stops training if Validation AUC-ROC does not improve after `patience` consecutive epochs.
+    Mode is set to 'max' (higher AUC is better).
     """
-    def __init__(self, patience: int = 7, min_delta: float = 1e-4):
+    def __init__(self, patience: int = 15, min_delta: float = 1e-4, mode: str = "max"):
         self.patience = patience
         self.min_delta = min_delta
+        self.mode = mode
         self.counter = 0
-        self.best_loss = float("inf")
+        self.best_auc = -float("inf") if mode == "max" else float("inf")
         self.early_stop = False
         self.best_epoch = 0
 
-    def __call__(self, val_loss: float, epoch: int) -> bool:
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
+    def __call__(self, val_auc: float, epoch: int) -> bool:
+        if self.mode == "max":
+            improved = val_auc > self.best_auc + self.min_delta
+        else:
+            improved = val_auc < self.best_auc - self.min_delta
+
+        if improved:
+            self.best_auc = val_auc
             self.best_epoch = epoch
             self.counter = 0
-            return True # Improved
+            return True # Improved best metric
         else:
             self.counter += 1
-            logger.info(f"EarlyStopping counter: {self.counter} out of {self.patience} (Best Val Loss: {self.best_loss:.4f} at Epoch {self.best_epoch})")
+            logger.info(f"EarlyStopping counter: {self.counter} out of {self.patience} (Best Val AUC: {self.best_auc:.4f} at Epoch {self.best_epoch})")
             if self.counter >= self.patience:
                 self.early_stop = True
             return False # No improvement
 
 
+class CB_FocalLoss(nn.Module):
+    """
+    Class-Balanced Focal Loss (Cui et al., CVPR 2019).
+    Calculates class weights based on the effective number of samples:
+        E_n = (1 - beta^N) / (1 - beta)
+        weight_i = (1 - beta) / (1 - beta^N_i)
+        alpha_i = weight_i / sum(weight) * num_classes
+    """
+    def __init__(self, samples_per_class: List[int], beta: float = 0.999, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.beta = beta
+        self.gamma = gamma
+        self.reduction = reduction
+
+        # Calculate effective number of samples per class
+        effective_num = 1.0 - np.power(beta, samples_per_class)
+        weights = (1.0 - beta) / np.array(effective_num, dtype=np.float32)
+        # Normalize weights so sum equals num_classes (2 for binary)
+        weights = weights / np.sum(weights) * len(samples_per_class)
+
+        # Class weights tensor [alpha_0 (REAL), alpha_1 (FAKE)]
+        self.class_weights = torch.tensor(weights, dtype=torch.float32)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        device = logits.device
+        class_weights = self.class_weights.to(device)
+
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_t = class_weights[1] * targets + class_weights[0] * (1.0 - targets)
+
+        cb_focal_loss = alpha_t * ((1.0 - p_t) ** self.gamma) * bce_loss
+
+        if self.reduction == "mean":
+            return cb_focal_loss.mean()
+        elif self.reduction == "sum":
+            return cb_focal_loss.sum()
+        return cb_focal_loss
+
+
+class FocalLoss(nn.Module):
+    """
+    Custom Focal Loss Class for handling severe class imbalance in deepfake detection.
+    FL(p_t) = - alpha_t * (1 - p_t)^gamma * log(p_t)
+    Numerical stability is ensured via F.binary_cross_entropy_with_logits.
+    """
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        focal_loss = alpha_t * (1.0 - p_t) ** self.gamma * bce_loss
+
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        return focal_loss
+
+# Aliases for backwards compatibility
+BinaryFocalLoss = FocalLoss
+EarlyStopping = EarlyStoppingAUC
+
+
 # ==========================================
-# 2. Multimodal Dynamic Gated Attention Adapter
+# 2. Modality Feature Dropout & Multimodal Dynamic Adapter
 # ==========================================
+class FeatureChannelDropout(nn.Module):
+    """
+    Randomly zeroes out entire modality feature channels during training (p=0.3).
+    Prevents the network from relying solely on any single modality (e.g. POS-rPPG),
+    forcing the model to learn robust temporal and spatial features.
+    """
+    def __init__(self, p: float = 0.3):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p <= 0.0:
+            return x
+        # 1D channel mask per sample
+        mask = (torch.rand(x.shape[0], 1, device=x.device) > self.p).float()
+        return (x * mask) / (1.0 - self.p)
+
+
 class MultimodalGatedAttentionAdapter(nn.Module):
     """
     Dynamic Modality Neglect Architecture for Multimodal Deepfake Detection.
     Evaluates incoming modality feature vectors (Spatial, Temporal, Biological),
     projects them into a shared latent space, and applies Softmax gating to assign
-    dynamic attention weights. Dropout regularization (p=0.4) prevents co-adaptation.
+    dynamic attention weights. Dropout regularization (p=0.5) and FeatureChannelDropout (p=0.3)
+    prevent co-adaptation and force robust temporal learning.
     """
     def __init__(
         self,
@@ -66,7 +163,8 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         temporal_dim: int = 512,
         biological_dim: int = 32,
         latent_dim: int = 256,
-        dropout: float = 0.4
+        dropout: float = 0.5,
+        modality_dropout: float = 0.3
     ):
         super().__init__()
         self.spatial_dim = spatial_dim
@@ -74,7 +172,10 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         self.biological_dim = biological_dim
         self.latent_dim = latent_dim
 
-        # Projection Heads with Dropout Regularization
+        # Feature Channel Dropout per Modality
+        self.modality_drop = FeatureChannelDropout(p=modality_dropout)
+
+        # Projection Heads with Heavy Dropout Regularization (p=0.5)
         self.proj_spatial = nn.Sequential(
             nn.Linear(spatial_dim, latent_dim),
             nn.BatchNorm1d(latent_dim),
@@ -125,6 +226,11 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         h_T = self.proj_temporal(x_T)
         h_B = self.proj_biological(x_B)
 
+        # Apply Feature Channel Dropout to prevent over-reliance on biological branch
+        h_S = self.modality_drop(h_S)
+        h_T = self.modality_drop(h_T)
+        h_B = self.modality_drop(h_B)
+
         h_cat = torch.cat([h_S, h_T, h_B], dim=-1)
 
         gate_logits = self.gating_network(h_cat)
@@ -150,42 +256,52 @@ class MultimodalGatedAttentionAdapter(nn.Module):
 class MultimodalDataset(Dataset):
     """
     PyTorch Dataset loading real fused .npz feature matrix.
+    Supports single or multiple comma-separated .npz feature files.
     Extracts features using key 'X' (shape: (N, 1824)) and labels using key 'y' (shape: (N,)).
     Raises explicit FileNotFoundError if dataset path does not exist.
     """
     def __init__(self, npz_path: str):
-        resolved_npz = str(resolve_path(npz_path))
-        
-        # Drive root fallback check for Google Colab
-        if not os.path.exists(resolved_npz) and os.path.exists("/content/drive/MyDrive/extracted_features.npz"):
-            resolved_npz = "/content/drive/MyDrive/extracted_features.npz"
-
-        if not os.path.exists(resolved_npz):
-            raise FileNotFoundError(
-                f"ERROR: Extracted dataset file not found at '{resolved_npz}'.\n"
-                f"Checked Locations:\n"
-                f" - /content/drive/MyDrive/extracted_features.npz\n"
-                f" - /content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz\n"
-                f" - ./outputs/features/extracted_features.npz\n"
-                f"Please ensure Stage 1 (extract_features.py) has completed successfully!"
-            )
-
-        data = np.load(resolved_npz)
-
-        # Exact Archive Key Mapping: 'X' for features, 'y' for labels
-        if "X" in data:
-            self.X = torch.tensor(data["X"], dtype=torch.float32)
+        if isinstance(npz_path, str) and "," in npz_path:
+            raw_paths = [p.strip() for p in npz_path.split(",")]
+        elif isinstance(npz_path, (list, tuple)):
+            raw_paths = npz_path
         else:
-            raise KeyError(f"Key 'X' missing in {resolved_npz}. Available keys: {list(data.keys())}")
+            raw_paths = [npz_path]
 
-        if "y" in data:
-            self.y = torch.tensor(data["y"], dtype=torch.float32)
-        else:
-            raise KeyError(f"Key 'y' missing in {resolved_npz}. Available keys: {list(data.keys())}")
+        X_list = []
+        y_list = []
+        spatial_dim, temporal_dim, biological_dim = 1280, 512, 32
 
-        self.spatial_dim = int(data.get("spatial_dim", 1280))
-        self.temporal_dim = int(data.get("temporal_dim", 512))
-        self.biological_dim = int(data.get("biological_dim", 32))
+        for path_item in raw_paths:
+            resolved_npz = str(resolve_path(path_item))
+            if not os.path.exists(resolved_npz) and os.path.exists("/content/drive/MyDrive/extracted_features.npz"):
+                resolved_npz = "/content/drive/MyDrive/extracted_features.npz"
+
+            if not os.path.exists(resolved_npz):
+                raise FileNotFoundError(f"ERROR: Extracted dataset file not found at '{resolved_npz}'.")
+
+            data = np.load(resolved_npz)
+            if "X" in data:
+                X_item = torch.nan_to_num(torch.tensor(data["X"], dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                X_list.append(X_item)
+            else:
+                raise KeyError(f"Key 'X' missing in {resolved_npz}. Available keys: {list(data.keys())}")
+
+            if "y" in data:
+                y_item = torch.tensor(data["y"], dtype=torch.float32)
+                y_list.append(y_item)
+            else:
+                raise KeyError(f"Key 'y' missing in {resolved_npz}. Available keys: {list(data.keys())}")
+
+            spatial_dim = int(data.get("spatial_dim", spatial_dim))
+            temporal_dim = int(data.get("temporal_dim", temporal_dim))
+            biological_dim = int(data.get("biological_dim", biological_dim))
+
+        self.X = torch.cat(X_list, dim=0)
+        self.y = torch.cat(y_list, dim=0)
+        self.spatial_dim = spatial_dim
+        self.temporal_dim = temporal_dim
+        self.biological_dim = biological_dim
 
     def __len__(self):
         return len(self.X)
@@ -194,6 +310,10 @@ class MultimodalDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+from sklearn.model_selection import GroupShuffleSplit
+
 def train_adapter(
     npz_path: Optional[str] = None,
     save_path: Optional[str] = None,
@@ -201,33 +321,28 @@ def train_adapter(
     batch_size: int = 16,
     lr: float = 1e-3,
     val_split: float = 0.2,
-    patience: int = 7,
-    dropout: float = 0.4,
-    weight_decay: float = 1e-4
+    patience: int = 15,
+    dropout: float = 0.5,
+    weight_decay: float = 1e-2,
+    balance_classes: bool = True,
+    use_focal_loss: bool = True,
+    focal_alpha: float = 0.75,
+    focal_gamma: float = 2.0
 ):
     """
-    Trains MultimodalGatedAttentionAdapter on extracted .npz features with train/val split.
-    Uses exact key mapping ('X', 'y'), Dropout (p=0.4), Weight Decay (1e-4), and EarlyStopping (patience=7).
+    Trains MultimodalGatedAttentionAdapter with Subject-Isolated GroupShuffleSplit, 
+    L2 Weight Decay (1e-2), CosineAnnealingWarmRestarts, and FeatureChannelDropout (p=0.3).
     """
-    target_npz = get_features_output_path("extracted_features.npz") if npz_path is None else resolve_path(npz_path)
+    if npz_path is None:
+        target_npz = get_features_output_path("extracted_features.npz")
+        str_npz_path = str(target_npz)
+    else:
+        str_npz_path = npz_path
+
     target_ckpt = get_checkpoint_path("attention_adapter.pth") if save_path is None else resolve_path(save_path)
-
-    str_npz_path = str(target_npz)
+    focal_ckpt = get_checkpoint_path("attention_adapter_focal.pth")
     str_ckpt_path = str(target_ckpt)
-
-    # Colab Drive root fallback check
-    if not os.path.exists(str_npz_path) and os.path.exists("/content/drive/MyDrive/extracted_features.npz"):
-        str_npz_path = "/content/drive/MyDrive/extracted_features.npz"
-
-    if not os.path.exists(str_npz_path):
-        raise FileNotFoundError(
-            f"ERROR: Extracted features file not found at: '{str_npz_path}'\n"
-            f"Expected Locations:\n"
-            f" - Colab Drive Root: '/content/drive/MyDrive/extracted_features.npz'\n"
-            f" - Colab Drive Subfolder: '/content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz'\n"
-            f" - Local Machine: './outputs/features/extracted_features.npz'\n"
-            f"Please run Stage 1 (extract_features.py) first to extract feature vectors!"
-        )
+    str_focal_ckpt_path = str(focal_ckpt)
 
     # Ensure parent checkpoint directory exists
     target_ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -235,28 +350,67 @@ def train_adapter(
     dataset = MultimodalDataset(str_npz_path)
     logger.info(f"Loaded Real Dataset '{str_npz_path}' | Samples: {len(dataset)} | Feature Matrix X: {dataset.X.shape}")
 
-    val_size = max(1, int(len(dataset) * val_split))
-    train_size = len(dataset) - val_size
+    # Subject-Isolated Group-Based Data Splitting (preventing identity leakage)
+    if hasattr(dataset, "groups") and dataset.groups is not None:
+        groups = dataset.groups
+    else:
+        # Group contiguous video frames (16 frames per video block) to prevent subject/frame leakage
+        groups = np.arange(len(dataset)) // 16
 
-    train_ds, val_ds = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
-    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=42)
+    train_indices, val_indices = next(gss.split(dataset.X, dataset.y, groups=groups))
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    train_ds = torch.utils.data.Subset(dataset, train_indices)
+    val_ds = torch.utils.data.Subset(dataset, val_indices)
+
+    logger.info(f"Subject-Isolated Split -> Train Samples: {len(train_ds)} | Val Samples: {len(val_ds)}")
+
+    # Class distribution in train split
+    train_targets = torch.tensor([dataset[i][1] for i in train_indices])
+    num_real = (train_targets == 0.0).sum().item()
+    num_fake = (train_targets == 1.0).sum().item()
+
+    logger.info(f"Training set raw class distribution -> Real (0.0): {num_real} | Fake (1.0): {num_fake}")
+
+    if balance_classes and num_real > 0 and num_fake > 0:
+        class_weights = [1.0 / num_real, 1.0 / num_fake]
+        sample_weights = [class_weights[int(t.item())] for t in train_targets]
+        sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler)
+        pos_weight = torch.tensor([num_real / num_fake]).to(device)
+        logger.info(f"Enabled Equal Ratio Class Balancing via WeightedRandomSampler & pos_weight ({pos_weight.item():.4f})")
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        pos_weight = None
+
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     model = MultimodalGatedAttentionAdapter(
         spatial_dim=dataset.spatial_dim,
         temporal_dim=dataset.temporal_dim,
         biological_dim=dataset.biological_dim,
-        dropout=dropout
+        dropout=dropout,
+        modality_dropout=0.3
     ).to(device)
 
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # Auto-detect class distribution directly from dataset y
+    all_y = dataset.y.numpy()
+    num_reals = int((all_y == 0.0).sum())
+    num_fakes = int((all_y == 1.0).sum())
+    samples_per_class = [num_reals, num_fakes]
+    logger.info(f"Auto-Detected Class Counts -> REAL (0.0): {num_reals} | FAKE (1.0): {num_fakes}")
 
-    early_stopping = EarlyStopping(patience=patience)
+    if use_focal_loss:
+        criterion = CB_FocalLoss(samples_per_class=samples_per_class, beta=0.999, gamma=focal_gamma)
+        logger.info(f"Using Class-Balanced FocalLoss (samples={samples_per_class}, beta=0.999, gamma={focal_gamma})")
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        logger.info("Using standard BCEWithLogitsLoss.")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+
+    early_stopping = EarlyStoppingAUC(patience=patience, mode="max")
 
     logger.info(f"Starting training (Max Epochs: {epochs}, Patience: {patience}, Dropout: {dropout}, WeightDecay: {weight_decay})...")
 
@@ -286,6 +440,7 @@ def train_adapter(
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         avg_weights = np.zeros(3)
+        val_probs_list, val_targets_list = [], []
 
         with torch.no_grad():
             for X_b, y_b in val_loader:
@@ -294,29 +449,40 @@ def train_adapter(
                 loss = criterion(logits, y_b)
 
                 val_loss += loss.item() * len(y_b)
-                preds = (torch.sigmoid(logits) >= 0.5).float()
+                probs = torch.sigmoid(logits)
+                preds = (probs >= 0.5).float()
                 val_correct += (preds == y_b).sum().item()
                 val_total += len(y_b)
                 avg_weights += attn.mean(dim=0).cpu().numpy() * len(y_b)
+                val_probs_list.append(probs.cpu())
+                val_targets_list.append(y_b.cpu())
 
         val_loss /= max(val_total, 1)
         val_acc = val_correct / max(val_total, 1)
         avg_weights /= max(val_total, 1)
 
+        val_probs_all = torch.cat(val_probs_list).numpy()
+        val_targets_all = torch.cat(val_targets_list).numpy()
+        if len(np.unique(val_targets_all)) > 1:
+            val_auc = float(roc_auc_score(val_targets_all, val_probs_all))
+        else:
+            val_auc = 0.5000
+
         logger.info(
             f"Epoch [{epoch:02d}/{epochs:02d}] "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc*100:.1f}% | "
-            f"Val Loss: {val_loss:.4f} Acc: {val_acc*100:.1f}% | "
+            f"Val Loss: {val_loss:.4f} Acc: {val_acc*100:.1f}% AUC: {val_auc:.4f} | "
             f"Weights -> S: {avg_weights[0]:.2f}, T: {avg_weights[1]:.2f}, B: {avg_weights[2]:.2f}"
         )
 
-        is_best = early_stopping(val_loss, epoch)
+        is_best = early_stopping(val_auc, epoch)
         if is_best:
             torch.save(model.state_dict(), str_ckpt_path)
-            logger.info(f"--> Saved best model checkpoint to '{str_ckpt_path}' (Val Loss: {val_loss:.4f})")
+            torch.save(model.state_dict(), str_focal_ckpt_path)
+            logger.info(f"--> Saved best model checkpoint to '{str_ckpt_path}' and '{str_focal_ckpt_path}' (Val AUC-ROC: {val_auc:.4f})")
 
         if early_stopping.early_stop:
-            logger.info(f"Early stopping triggered at Epoch {epoch}! Best Val Loss: {early_stopping.best_loss:.4f} at Epoch {early_stopping.best_epoch}.")
+            logger.info(f"Early stopping triggered at Epoch {epoch}! Best Val AUC-ROC: {early_stopping.best_auc:.4f} at Epoch {early_stopping.best_epoch}.")
             break
 
     # Restore optimal checkpoint

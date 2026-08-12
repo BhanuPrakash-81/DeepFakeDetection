@@ -52,16 +52,23 @@ def evaluate_model(
     str_ckpt = str(target_ckpt)
     str_roc = str(target_roc)
 
+    if not os.path.exists(str_npz) and os.path.exists("features_out/extracted_features.npz"):
+        str_npz = str(resolve_path("features_out/extracted_features.npz"))
+    if not os.path.exists(str_npz) and os.path.exists("features_out/extracted_features_ff++.npz"):
+        str_npz = str(resolve_path("features_out/extracted_features_ff++.npz"))
+    if not os.path.exists(str_npz) and os.path.exists("/content/drive/MyDrive/extracted_features.npz"):
+        str_npz = "/content/drive/MyDrive/extracted_features.npz"
+
     if not os.path.exists(str_npz):
         raise FileNotFoundError(
             f"ERROR: Dataset features file not found at '{str_npz}'.\n"
             f"Colab Drive Location : /content/drive/MyDrive/DeepFake_Outputs/features/extracted_features.npz\n"
-            f"Local Machine Location: ./outputs/features/extracted_features.npz\n"
+            f"Local Machine Location: ./outputs/features/extracted_features.npz or ./features_out/extracted_features.npz\n"
             f"Please run Stage 1 (extract_features.py) first to generate the dataset!"
         )
 
     dataset = MultimodalDataset(str_npz)
-    X_tensor = dataset.X.to(device)
+    X_tensor = torch.nan_to_num(dataset.X, nan=0.0, posinf=0.0, neginf=0.0).to(device)
     y_true = dataset.y.numpy()
 
     model = MultimodalGatedAttentionAdapter(

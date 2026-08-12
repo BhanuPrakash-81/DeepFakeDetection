@@ -9,6 +9,7 @@ features_out/
 *.npz
 
 # Model checkpoints & large assets
+outputs/
 *.pth
 *.task
 *.png

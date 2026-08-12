@@ -28,13 +28,35 @@ class WebcamStream(threading.Thread):
     def __init__(self, source: Any = 0, queue_capacity: int = 2):
         super().__init__()
         self.source = source
-        self.cap = cv2.VideoCapture(source)
-        self.q = queue.Queue(maxsize=queue_capacity)
         self.stopped = False
         self.is_synthetic = False
 
+        if isinstance(source, str) and ("youtube.com" in source.lower() or "youtu.be" in source.lower()):
+            logger.info(f"Extracting YouTube stream URL for '{source}' via yt_dlp...")
+            try:
+                import yt_dlp
+                ydl_opts = {
+                    'format': 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'quiet': True,
+                    'no_warnings': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(source, download=False)
+                    stream_url = info.get('url', None)
+                    if not stream_url and 'requested_formats' in info:
+                        stream_url = info['requested_formats'][0]['url']
+                    title = info.get('title', 'YouTube Stream')
+                    if stream_url:
+                        logger.info(f"Successfully resolved YouTube stream for: '{title}'")
+                        source = stream_url
+            except Exception as e:
+                logger.error(f"Failed to extract YouTube stream with yt_dlp: {e}")
+
+        self.cap = cv2.VideoCapture(source)
+        self.q = queue.Queue(maxsize=queue_capacity)
+
         if not self.cap.isOpened():
-            logger.warning(f"Could not open camera source '{source}'. Falling back to synthetic stream.")
+            logger.warning(f"Could not open stream source '{self.source}'. Falling back to synthetic stream.")
             self.is_synthetic = True
 
     def run(self):
@@ -57,8 +79,10 @@ class WebcamStream(threading.Thread):
                     self.stopped = True
                     break
 
-            if not self.q.full():
-                self.q.put(frame)
+            try:
+                self.q.put(frame, timeout=1.0)
+            except queue.Full:
+                pass
 
     def read(self) -> Optional[np.ndarray]:
         try:
@@ -122,9 +146,11 @@ class LiveInferencePipeline:
             temporal_vec = self.temporal_extractor(seq_tensor)
 
             bio_arr = self.rppg_extractor.extract_pos_rppg(list(self.forehead_buffer))
+            bio_arr = np.nan_to_num(bio_arr, nan=0.0, posinf=0.0, neginf=0.0)
             bio_vec = torch.from_numpy(bio_arr).unsqueeze(0).float().to(device)
 
             fused_vector = torch.cat([spatial_vec, temporal_vec, bio_vec], dim=-1)
+            fused_vector = torch.nan_to_num(fused_vector, nan=0.0, posinf=0.0, neginf=0.0)
 
             logits, attn_weights = self.model(fused_vector)
             prob = torch.sigmoid(logits).item()
@@ -173,15 +199,15 @@ class LiveInferencePipeline:
 
 
 def run_live_inference(source: Any = 0, model_path: Optional[str] = None):
+    pipeline = LiveInferencePipeline(model_path=model_path)
     stream = WebcamStream(source=source)
     stream.start()
-
-    pipeline = LiveInferencePipeline(model_path=model_path)
-    logger.info("Live Video Inference initialized. Press 'q' or 'Esc' to exit.")
+    logger.info("Live Video Inference initialized.")
 
     prev_time = time.time()
     fps = 0.0
     label, conf, weights = "ANALYZING...", 0.0, np.array([0.33, 0.33, 0.34])
+    last_reported_label = None
 
     while not stream.stopped:
         frame = stream.read()
@@ -196,6 +222,9 @@ def run_live_inference(source: Any = 0, model_path: Optional[str] = None):
 
             if len(pipeline.frame_buffer) == pipeline.seq_len:
                 label, conf, weights = pipeline.process_buffer()
+                if label != last_reported_label:
+                    logger.info(f"Live Detection: {label} (Confidence: {conf:.2f}%) | Weights -> S: {weights[0]:.2f}, T: {weights[1]:.2f}, B: {weights[2]:.2f}")
+                    last_reported_label = label
 
         curr_time = time.time()
         fps = 1.0 / max(curr_time - prev_time, 1e-4)
@@ -205,15 +234,21 @@ def run_live_inference(source: Any = 0, model_path: Optional[str] = None):
         cv2.putText(display_frame, f"Pipeline FPS: {fps:.1f}", (display_frame.shape[1] - 170, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
 
-        cv2.imshow("Multimodal Deepfake Detection - Dynamic Modality Neglect", display_frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == 27:
-            break
+        try:
+            cv2.imshow("Multimodal Deepfake Detection - Dynamic Modality Neglect", display_frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+        except Exception as e:
+            # Fallback for headless environments without GUI display
+            pass
 
     stream.stop()
-    cv2.destroyAllWindows()
-    logger.info("Live Video Inference closed.")
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+    logger.info(f"Live Video Inference completed. Final Classification: {label} ({conf:.2f}%)")
 
 
 if __name__ == "__main__":
