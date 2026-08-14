@@ -104,7 +104,7 @@ class LiveInferencePipeline:
         self.seq_len = seq_len
         self.face_processor = FaceProcessor()
         self.spatial_extractor = SpatialExtractor().to(device)
-        self.temporal_extractor = TemporalShiftModule(in_channels=self.spatial_extractor.feature_dim).to(device)
+        self.temporal_extractor = TemporalShiftModule().to(device)
         self.rppg_extractor = POSrPPGExtractor()
 
         target_ckpt = get_checkpoint_path("attention_adapter.pth") if model_path is None else resolve_path(model_path)

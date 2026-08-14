@@ -126,57 +126,29 @@ class FaceProcessor:
 # 2. Extractors: Spatial, Temporal, Biological
 # ==========================================
 class SpatialExtractor(nn.Module):
-    """
-    Pre-trained Spatial Feature Backbone using timm (Xception / EfficientNet).
-    Extracts high-dimensional spatial feature vectors (2048-dim for Xception, 1280-dim for EfficientNet-B0).
-    """
-    def __init__(self, model_name: str = "xception", pretrained: bool = True):
+    def __init__(self):
         super().__init__()
-        self.model_name = model_name
-        self.use_timm = False
-
-        try:
-            import timm
-            target_model = "legacy_xception" if model_name == "xception" else model_name
-            self.model = timm.create_model(target_model, pretrained=pretrained, num_classes=0)
-            self.feature_dim = self.model.num_features
-            self.use_timm = True
-            logger.info(f"Initialized pre-trained timm backbone '{target_model}' (Feature Dim: {self.feature_dim})")
-        except Exception as e:
-            logger.warning(f"Could not load timm backbone '{model_name}': {e}. Falling back to torchvision EfficientNet-B0.")
-            weights = models.EfficientNet_B0_Weights.DEFAULT
-            backbone = models.efficientnet_b0(weights=weights)
-            self.feature_extractor = backbone.features
-            self.pool = backbone.avgpool
-            self.feature_dim = 1280
-
+        weights = models.EfficientNet_B0_Weights.DEFAULT
+        backbone = models.efficientnet_b0(weights=weights)
+        self.feature_extractor = backbone.features
+        self.pool = backbone.avgpool
+        self.feature_dim = 1280
         for p in self.parameters():
             p.requires_grad = False
         self.eval()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            if self.use_timm:
-                feat = self.model(x)
-                if feat.dim() > 2:
-                    feat = torch.flatten(F.adaptive_avg_pool2d(feat, (1, 1)), 1)
-            else:
-                feat = self.feature_extractor(x)
-                feat = self.pool(feat)
-                feat = torch.flatten(feat, 1)
+            feat = self.feature_extractor(x)
+            feat = self.pool(feat)
+            feat = torch.flatten(feat, 1)
         return feat
 
 
 class TemporalShiftModule(nn.Module):
-    """
-    Pre-trained Temporal Shift Module (TSM) 1D feature extractor.
-    Dynamically accepts spatial feature channel dimension (e.g. 2048 or 1280)
-    and projects into a robust 512-dim temporal feature vector.
-    """
-    def __init__(self, in_channels: int = 2048, out_channels: int = 512, n_div: int = 8):
+    def __init__(self, in_channels: int = 1280, out_channels: int = 512, n_div: int = 8):
         super().__init__()
         self.in_channels = in_channels
-        self.out_channels = out_channels
         self.n_div = n_div
         self.conv = nn.Sequential(
             nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
@@ -191,18 +163,9 @@ class TemporalShiftModule(nn.Module):
     def forward(self, seq_features: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             B, T, C = seq_features.shape
-            # Dynamic Channel Adaptation Safety Guarantee
-            if self.conv[0].in_channels != C:
-                self.conv[0] = nn.Conv1d(C, self.out_channels, kernel_size=3, padding=1).to(seq_features.device)
-                self.conv.eval()
-
             if T <= 1:
-                if C >= self.out_channels:
-                    return seq_features.mean(dim=1)[:, :self.out_channels]
-                else:
-                    pad = torch.zeros(B, self.out_channels - C, device=seq_features.device)
-                    return torch.cat([seq_features.mean(dim=1), pad], dim=-1)
-
+                return seq_features.mean(dim=1)[:, :512]
+            
             fold = C // self.n_div
             shifted = torch.zeros_like(seq_features)
             shifted[:, :-1, :fold] = seq_features[:, 1:, :fold]
@@ -326,7 +289,7 @@ def extract_dataset(data_dir: str, output_path: Optional[str] = None, augment: b
 
     face_processor = FaceProcessor(model_path="face_landmarker.task")
     spatial_extractor = SpatialExtractor().to(device)
-    temporal_extractor = TemporalShiftModule(in_channels=spatial_extractor.feature_dim).to(device)
+    temporal_extractor = TemporalShiftModule().to(device)
     rppg_extractor = POSrPPGExtractor()
 
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
