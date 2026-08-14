@@ -74,20 +74,16 @@ class CB_FocalLoss(nn.Module):
         # Calculate effective number of samples per class
         effective_num = 1.0 - np.power(beta, samples_per_class)
         weights = (1.0 - beta) / np.array(effective_num, dtype=np.float32)
-        # Normalize weights so sum equals num_classes (2 for binary)
         weights = weights / np.sum(weights) * len(samples_per_class)
 
-        # Class weights tensor [alpha_0 (REAL), alpha_1 (FAKE)]
-        self.class_weights = torch.tensor(weights, dtype=torch.float32)
+        # Register class weights buffer [alpha_0 (REAL), alpha_1 (FAKE)]
+        self.register_buffer("class_weights", torch.tensor(weights, dtype=torch.float32))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        device = logits.device
-        class_weights = self.class_weights.to(device)
-
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
         probs = torch.sigmoid(logits)
         p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
-        alpha_t = class_weights[1] * targets + class_weights[0] * (1.0 - targets)
+        alpha_t = self.class_weights[1] * targets + self.class_weights[0] * (1.0 - targets)
 
         cb_focal_loss = alpha_t * ((1.0 - p_t) ** self.gamma) * bce_loss
 
@@ -151,11 +147,10 @@ class FeatureChannelDropout(nn.Module):
 
 class MultimodalGatedAttentionAdapter(nn.Module):
     """
-    Dynamic Modality Neglect Architecture for Multimodal Deepfake Detection.
+    Quality-Aware Dynamic Modality Neglect Architecture for Multimodal Deepfake Detection.
     Evaluates incoming modality feature vectors (Spatial, Temporal, Biological),
-    projects them into a shared latent space, and applies Softmax gating to assign
-    dynamic attention weights. Dropout regularization (p=0.5) and FeatureChannelDropout (p=0.3)
-    prevent co-adaptation and force robust temporal learning.
+    estimates video quality dynamically, and applies Softmax gating to assign
+    proportional attention weights across modalities.
     """
     def __init__(
         self,
@@ -233,7 +228,12 @@ class MultimodalGatedAttentionAdapter(nn.Module):
 
         h_cat = torch.cat([h_S, h_T, h_B], dim=-1)
 
-        gate_logits = self.gating_network(h_cat)
+        # Compute Quality Bias from spatial feature variance (proxy for image degradation)
+        s_var = torch.var(x_S, dim=-1, keepdim=True)
+        q_score = torch.sigmoid(s_var - 1.0)
+        quality_bias = torch.cat([0.5 * q_score, 0.5 * (1.0 - q_score), torch.zeros_like(q_score)], dim=-1)
+
+        gate_logits = self.gating_network(h_cat) + quality_bias
         attn_weights = F.softmax(gate_logits, dim=-1)
 
         w_S = attn_weights[:, 0:1]
@@ -248,6 +248,7 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         logits = self.cls_head(h_fused).squeeze(-1)
 
         return logits, attn_weights
+
 
 
 from sklearn.preprocessing import StandardScaler
