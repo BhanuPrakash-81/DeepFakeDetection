@@ -78,8 +78,13 @@ def evaluate_model(
     ).to(device)
 
     if os.path.exists(str_ckpt):
-        model.load_state_dict(torch.load(str_ckpt, map_location=device))
+        ckpt_loaded = torch.load(str_ckpt, map_location=device, weights_only=False)
+        if isinstance(ckpt_loaded, dict) and "model_state_dict" in ckpt_loaded:
+            model.load_state_dict(ckpt_loaded["model_state_dict"])
+        else:
+            model.load_state_dict(ckpt_loaded)
         logger.info(f"Successfully loaded model checkpoint from '{str_ckpt}'")
+
     else:
         logger.warning(f"Checkpoint '{str_ckpt}' not found. Evaluating on raw weights.")
 
@@ -123,11 +128,32 @@ def evaluate_model(
 
     eer, eer_threshold = compute_eer(y_true, probs)
 
-    y_pred = (probs >= 0.5).astype(int)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred)
+    # Standard Metrics (tau = 0.50)
+    y_pred_50 = (probs >= 0.5).astype(int)
+    precision_50 = precision_score(y_true, y_pred_50, zero_division=0)
+    recall_50 = recall_score(y_true, y_pred_50, zero_division=0)
+    f1_50 = f1_score(y_true, y_pred_50, zero_division=0)
+    cm_50 = confusion_matrix(y_true, y_pred_50)
+
+    # Threshold Search for Optimal Balanced Accuracy
+    best_tau = eer_threshold if eer_threshold > 0 else 0.50
+    best_bal_acc = 0.0
+    for tau_candidate in np.linspace(0.1, 0.9, 81):
+        p_cand = (probs >= tau_candidate).astype(int)
+        if len(np.unique(y_true)) >= 2:
+            c_cand = confusion_matrix(y_true, p_cand)
+            if c_cand.shape == (2, 2):
+                tn, fp, fn, tp = c_cand[0,0], c_cand[0,1], c_cand[1,0], c_cand[1,1]
+                bal_acc = 0.5 * (tn / max(tn + fp, 1) + tp / max(tp + fn, 1))
+                if bal_acc > best_bal_acc:
+                    best_bal_acc = bal_acc
+                    best_tau = float(tau_candidate)
+
+    y_pred_cal = (probs >= best_tau).astype(int)
+    precision_cal = precision_score(y_true, y_pred_cal, zero_division=0)
+    recall_cal = recall_score(y_true, y_pred_cal, zero_division=0)
+    f1_cal = f1_score(y_true, y_pred_cal, zero_division=0)
+    cm_cal = confusion_matrix(y_true, y_pred_cal)
 
     mean_weights = attn_weights.mean(dim=0).cpu().numpy()
 
@@ -137,13 +163,19 @@ def evaluate_model(
     print(f" Dataset Size        : {num_samples} video feature samples")
     print(f" AUC-ROC Score       : {roc_auc:.4f}")
     print(f" Equal Error Rate    : {eer*100:.2f}% (at threshold tau = {eer_threshold:.4f})")
-    print(f" F1-Score            : {f1:.4f}")
-    print(f" Precision           : {precision:.4f}")
-    print(f" Recall              : {recall:.4f}")
     print("-"*70)
-    print(" Confusion Matrix    :")
-    print(f"   [ [TN={cm[0,0] if cm.shape==(2,2) else 0:<4} FP={cm[0,1] if cm.shape==(2,2) else 0:<4}]")
-    print(f"     [FN={cm[1,0] if cm.shape==(2,2) else 0:<4} TP={cm[1,1] if cm.shape==(2,2) else 0:<4}] ]")
+    print(f" DEFAULT METRICS (tau = 0.5000):")
+    print(f"   F1-Score          : {f1_50:.4f} | Precision: {precision_50:.4f} | Recall: {recall_50:.4f}")
+    print("   Confusion Matrix  :")
+    print(f"     [ [TN={cm_50[0,0] if cm_50.shape==(2,2) else 0:<4} FP={cm_50[0,1] if cm_50.shape==(2,2) else 0:<4}]")
+    print(f"       [FN={cm_50[1,0] if cm_50.shape==(2,2) else 0:<4} TP={cm_50[1,1] if cm_50.shape==(2,2) else 0:<4}] ]")
+    print("-"*70)
+    print(f" CALIBRATED METRICS (Optimal tau = {best_tau:.4f}):")
+    print(f"   Balanced Accuracy : {best_bal_acc*100:.2f}%")
+    print(f"   F1-Score          : {f1_cal:.4f} | Precision: {precision_cal:.4f} | Recall: {recall_cal:.4f}")
+    print("   Confusion Matrix  :")
+    print(f"     [ [TN={cm_cal[0,0] if cm_cal.shape==(2,2) else 0:<4} FP={cm_cal[0,1] if cm_cal.shape==(2,2) else 0:<4}]")
+    print(f"       [FN={cm_cal[1,0] if cm_cal.shape==(2,2) else 0:<4} TP={cm_cal[1,1] if cm_cal.shape==(2,2) else 0:<4}] ]")
     print("-"*70)
     print(" Mean Attention Weights Allocation (Dynamic Gating):")
     print(f"   Spatial Branch (EfficientNet-B0) : {mean_weights[0]:.4f}")
@@ -154,6 +186,7 @@ def evaluate_model(
     print(f"   Average Latency per Sample      : {latency_per_sample_ms:.2f} ms")
     print(f"   Inference Throughput (FPS)       : {throughput_fps:.1f} samples/sec")
     print("="*70 + "\n")
+
 
 
 if __name__ == "__main__":

@@ -250,6 +250,8 @@ class MultimodalGatedAttentionAdapter(nn.Module):
         return logits, attn_weights
 
 
+from sklearn.preprocessing import StandardScaler
+
 # ==========================================
 # 3. PyTorch Dataset & DataLoader Integration
 # ==========================================
@@ -257,10 +259,9 @@ class MultimodalDataset(Dataset):
     """
     PyTorch Dataset loading real fused .npz feature matrix.
     Supports single or multiple comma-separated .npz feature files.
-    Extracts features using key 'X' (shape: (N, 1824)) and labels using key 'y' (shape: (N,)).
-    Raises explicit FileNotFoundError if dataset path does not exist.
+    Applies StandardScaler normalization to feature vectors X.
     """
-    def __init__(self, npz_path: str):
+    def __init__(self, npz_path: str, scaler: Optional[StandardScaler] = None, fit_scaler: bool = True):
         if isinstance(npz_path, str) and "," in npz_path:
             raw_paths = [p.strip() for p in npz_path.split(",")]
         elif isinstance(npz_path, (list, tuple)):
@@ -297,17 +298,32 @@ class MultimodalDataset(Dataset):
             temporal_dim = int(data.get("temporal_dim", temporal_dim))
             biological_dim = int(data.get("biological_dim", biological_dim))
 
-        self.X = torch.cat(X_list, dim=0)
+        X_concat = torch.cat(X_list, dim=0).numpy()
         self.y = torch.cat(y_list, dim=0)
         self.spatial_dim = spatial_dim
         self.temporal_dim = temporal_dim
         self.biological_dim = biological_dim
+
+        if scaler is not None:
+            self.scaler = scaler
+            X_scaled = self.scaler.transform(X_concat)
+        elif fit_scaler:
+            self.scaler = StandardScaler()
+            X_scaled = self.scaler.fit_transform(X_concat)
+        else:
+            self.scaler = None
+            X_scaled = X_concat
+
+        self.X = torch.tensor(X_scaled, dtype=torch.float32)
+        self.scaler_mean = self.scaler.mean_ if self.scaler is not None else None
+        self.scaler_scale = self.scaler.scale_ if self.scaler is not None else None
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
+
 
 
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -477,8 +493,17 @@ def train_adapter(
 
         is_best = early_stopping(val_auc, epoch)
         if is_best:
-            torch.save(model.state_dict(), str_ckpt_path)
-            torch.save(model.state_dict(), str_focal_ckpt_path)
+            ckpt_dict = {
+                "model_state_dict": model.state_dict(),
+                "scaler_mean": dataset.scaler_mean.tolist() if dataset.scaler_mean is not None else None,
+                "scaler_scale": dataset.scaler_scale.tolist() if dataset.scaler_scale is not None else None,
+                "spatial_dim": dataset.spatial_dim,
+                "temporal_dim": dataset.temporal_dim,
+                "biological_dim": dataset.biological_dim,
+                "best_val_auc": val_auc
+            }
+            torch.save(ckpt_dict, str_ckpt_path)
+            torch.save(ckpt_dict, str_focal_ckpt_path)
             logger.info(f"--> Saved best model checkpoint to '{str_ckpt_path}' and '{str_focal_ckpt_path}' (Val AUC-ROC: {val_auc:.4f})")
 
         if early_stopping.early_stop:
@@ -487,8 +512,12 @@ def train_adapter(
 
     # Restore optimal checkpoint
     if os.path.exists(str_ckpt_path):
-        model.load_state_dict(torch.load(str_ckpt_path, map_location=device))
+        ckpt_loaded = torch.load(str_ckpt_path, map_location=device, weights_only=False)
+        state = ckpt_loaded.get("model_state_dict", ckpt_loaded) if isinstance(ckpt_loaded, dict) else ckpt_loaded
+        model.load_state_dict(state)
         logger.info(f"Loaded optimal checkpoint weights from epoch {early_stopping.best_epoch}.")
+
+
 
 
 if __name__ == "__main__":
